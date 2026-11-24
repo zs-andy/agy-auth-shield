@@ -535,7 +535,9 @@ PY
 
   mkdir -p "${SHIELD_HOME}/backups"
   chmod 700 "${SHIELD_HOME}/backups"
-  local backup_file="${SHIELD_HOME}/backups/t3-settings.$(date +%Y%m%d%H%M%S).json"
+  local ts backup_file
+  ts="$(date +%Y%m%d%H%M%S)"
+  backup_file="${SHIELD_HOME}/backups/t3-settings.${ts}.json"
   cp "$T3_SETTINGS" "$backup_file"
   chmod 600 "$backup_file"
 
@@ -840,10 +842,10 @@ cmd_uninstall() {
   if [[ -n "$SHIELD_HOME" && "$SHIELD_HOME" != "/" && "$SHIELD_HOME" != "$HOME" && -d "$SHIELD_HOME" ]]; then
     if [[ -f "${SHIELD_HOME}/.agy-auth-shield-managed" || -f "${SHIELD_HOME}/agy_auth_shield.py" ]]; then
       if [[ "$keep_logs" == "1" ]]; then
-        rm -rf "${SHIELD_HOME}/bin" "${SHIELD_HOME}/run" "${SHIELD_HOME}/__pycache__" \
-               "${SHIELD_HOME}/backups" "${SHIELD_HOME}/agy_auth_shield.py" \
-               "${SHIELD_HOME}/VERSION" "${SHIELD_HOME}/config.env" \
-               "${SHIELD_HOME}/.agy-auth-shield-managed"
+        rm -rf "${SHIELD_HOME:?}/bin" "${SHIELD_HOME:?}/run" "${SHIELD_HOME:?}/__pycache__" \
+               "${SHIELD_HOME:?}/backups" "${SHIELD_HOME:?}/agy_auth_shield.py" \
+               "${SHIELD_HOME:?}/VERSION" "${SHIELD_HOME:?}/config.env" \
+               "${SHIELD_HOME:?}/.agy-auth-shield-managed"
         ok "Removed program files (logs preserved in ${SHIELD_HOME})"
       else
         rm -rf "$SHIELD_HOME"

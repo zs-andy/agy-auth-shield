@@ -173,10 +173,10 @@ fi
 if [[ -n "$SHIELD_HOME" && "$SHIELD_HOME" != "/" && "$SHIELD_HOME" != "$HOME" && -d "$SHIELD_HOME" ]]; then
   if [[ -f "${SHIELD_HOME}/.agy-auth-shield-managed" || -f "${SHIELD_HOME}/agy_auth_shield.py" ]]; then
     if [[ "$OPT_KEEP_LOGS" == "1" ]]; then
-      rm -rf "${SHIELD_HOME}/bin" "${SHIELD_HOME}/run" "${SHIELD_HOME}/__pycache__" \
-             "${SHIELD_HOME}/backups" "${SHIELD_HOME}/agy_auth_shield.py" \
-             "${SHIELD_HOME}/VERSION" "${SHIELD_HOME}/config.env" \
-             "${SHIELD_HOME}/.agy-auth-shield-managed"
+      rm -rf "${SHIELD_HOME:?}/bin" "${SHIELD_HOME:?}/run" "${SHIELD_HOME:?}/__pycache__" \
+             "${SHIELD_HOME:?}/backups" "${SHIELD_HOME:?}/agy_auth_shield.py" \
+             "${SHIELD_HOME:?}/VERSION" "${SHIELD_HOME:?}/config.env" \
+             "${SHIELD_HOME:?}/.agy-auth-shield-managed"
     else
       rm -rf "$SHIELD_HOME"
     fi
