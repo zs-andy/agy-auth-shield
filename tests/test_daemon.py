@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import socketserver
 import stat
 import subprocess
 import sys
@@ -42,6 +43,17 @@ def http_json(port: int, method: str, path: str, headers=None, body=None):
         return resp.status, json.loads(raw.decode("utf-8")) if raw else None
     finally:
         conn.close()
+
+
+class FastThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
 
 class DaemonIntegrationTests(unittest.TestCase):
@@ -135,8 +147,7 @@ class DaemonIntegrationTests(unittest.TestCase):
                 self.wfile.write(raw)
                 self.wfile.flush()
 
-        self.mock_srv = ThreadingHTTPServer(("127.0.0.1", self.mock_port), MockUpstream)
-        self.mock_srv.daemon_threads = True
+        self.mock_srv = FastThreadingHTTPServer(("127.0.0.1", self.mock_port), MockUpstream)
         threading.Thread(target=self.mock_srv.serve_forever, daemon=True).start()
 
         # Fake `agy` binary used by Tier-2 probes
@@ -145,9 +156,10 @@ class DaemonIntegrationTests(unittest.TestCase):
         self.fake_agy = self.fake_bin_dir / "agy"
         self.probe_token_file = self.tmp / "probe_token.txt"
         self.probe_acp_log = self.tmp / "probe_acp_methods.txt"
+        self.probe_err_log = self.tmp / "probe_err.txt"
         self.probe_token_file.write_text("tok_probed_fresh\n", encoding="utf-8")
         self.fake_agy.write_text(
-            f"""#!/usr/bin/env python3
+            f"""#!{sys.executable}
 import json, os, sys, urllib.request
 url = os.environ["CLOUD_CODE_URL"].rstrip("/") + "/v1internal:loadCodeAssist"
 tok = open({str(self.probe_token_file)!r}).read().strip()
@@ -161,8 +173,9 @@ def hit():
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             r.read()
-    except Exception:
-        pass
+    except Exception as exc:
+        with open({str(self.probe_err_log)!r}, "a") as ef:
+            ef.write(repr(exc) + "\\n")
 if len(sys.argv) > 1 and sys.argv[1] == "acp":
     for line in sys.stdin:
         msg = json.loads(line)
@@ -404,7 +417,13 @@ else:
             headers={"Authorization": "Bearer tok_acp_expired"},
             body={"turn": 1},
         )
-        self.assertEqual((st, d["tok"]), (200, "tok_acp_probed"))
+        diag = (
+            f"status={st} body={d} "
+            f"probe_err={self.probe_err_log.read_text(encoding='utf-8') if self.probe_err_log.exists() else ''} "
+            f"log={(self.shield_home / 'shield.log').read_text(encoding='utf-8') if (self.shield_home / 'shield.log').exists() else ''}"
+        )
+        self.assertEqual(st, 200, diag)
+        self.assertEqual(d.get("tok"), "tok_acp_probed", diag)
         acp_methods = self.probe_acp_log.read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(acp_methods, ["initialize", "authenticate"])
 

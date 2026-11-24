@@ -30,6 +30,7 @@ import secrets
 import shutil
 import signal
 import socket
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -882,6 +883,14 @@ class ShieldHTTPServer(ThreadingHTTPServer):
     ) -> None:
         self.engine = engine
         super().__init__(server_address, ShieldRequestHandler)
+
+    def server_bind(self) -> None:
+        # Skip HTTPServer.server_bind()'s socket.getfqdn() reverse-DNS lookup,
+        # which can stall daemon startup for 15-30s on macOS/VPN/offline networks.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
     def process_request(self, request, client_address) -> None:
         try:

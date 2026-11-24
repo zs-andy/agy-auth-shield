@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -177,11 +178,15 @@ class LifecycleTests(unittest.TestCase):
         try:
             # Wait via wrapper auto-detect / status
             res_st = None
-            for _ in range(30):
+            for _ in range(50):
                 res_st = self._run([BASH_BIN, cli, "status", "--json"], check=False)
                 if res_st.returncode == 0:
                     break
-            assert res_st is not None and res_st.returncode == 0, res_st.stderr
+                time.sleep(0.15)
+            assert res_st is not None and res_st.returncode == 0, (
+                f"rc={res_st.returncode if res_st else None} stdout={res_st.stdout if res_st else ''} "
+                f"stderr={res_st.stderr if res_st else ''}"
+            )
             st_obj = json.loads(res_st.stdout)
             self.assertTrue(st_obj["ok"])
             self.assertEqual(st_obj["port"], self.port)
