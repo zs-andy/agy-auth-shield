@@ -1,0 +1,887 @@
+#!/usr/bin/env bash
+# Production management CLI for agy-auth-shield.
+set -euo pipefail
+
+SHIELD_HOME="${AGY_AUTH_SHIELD_HOME:-$HOME/.local/share/agy-auth-shield}"
+if [[ -r "${SHIELD_HOME}/config.env" ]]; then
+  _caller_port="${AGY_AUTH_SHIELD_PORT:-}"
+  _caller_label="${AGY_AUTH_SHIELD_LABEL:-}"
+  # shellcheck disable=SC1091
+  source "${SHIELD_HOME}/config.env" 2>/dev/null || true
+  [[ -n "$_caller_port" ]] && AGY_AUTH_SHIELD_PORT="$_caller_port"
+  [[ -n "$_caller_label" ]] && AGY_AUTH_SHIELD_LABEL="$_caller_label"
+fi
+
+SHIELD_PORT="${AGY_AUTH_SHIELD_PORT:-18765}"
+SHIELD_BASE="http://127.0.0.1:${SHIELD_PORT}"
+SERVICE_LABEL="${AGY_AUTH_SHIELD_LABEL:-io.github.zs-andy.agy-auth-shield}"
+REPO_SLUG="${AGY_AUTH_SHIELD_REPO:-zs-andy/agy-auth-shield}"
+TOKEN_FILE="${SHIELD_HOME}/run/control.token"
+PID_FILE="${SHIELD_HOME}/run/daemon.pid"
+LOG_FILE="${SHIELD_HOME}/shield.log"
+WRAPPER_PATH="${SHIELD_HOME}/bin/agy"
+DAEMON_LAUNCHER="${SHIELD_HOME}/bin/agy-auth-shield-daemon"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+PLIST_PATH="${PLIST_DIR}/${SERVICE_LABEL}.plist"
+SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SYSTEMD_UNIT="${SYSTEMD_DIR}/agy-auth-shield.service"
+T3_SETTINGS="${AGY_AUTH_SHIELD_T3_SETTINGS:-$HOME/.t3/userdata/settings.json}"
+OS_NAME="$(uname -s 2>/dev/null || printf 'unknown')"
+UID_NUM="$(id -u)"
+CURL_BIN="$(command -v curl 2>/dev/null || printf '%s' '/usr/bin/curl')"
+PYTHON_BIN="$(command -v python3 2>/dev/null || printf '%s' '/usr/bin/python3')"
+
+# Color helpers (disabled when non-TTY or NO_COLOR is set)
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_RED=$'\033[31m'
+  C_CYAN=$'\033[36m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_RED=""
+  C_CYAN=""
+fi
+
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+err()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+info() { printf '%s·%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+
+read_version() {
+  if [[ -r "${SHIELD_HOME}/VERSION" ]]; then
+    tr -d '\r\n' < "${SHIELD_HOME}/VERSION"
+  else
+    printf '1.1.0'
+  fi
+}
+
+usage() {
+  cat <<EOF
+${C_BOLD}agy-auth-shield${C_RESET} $(read_version) — Transparent OAuth 401 auto-healing gateway for Antigravity CLI & T3 Code
+
+${C_BOLD}Usage:${C_RESET}
+  agy-auth-shield <command> [options]
+
+${C_BOLD}Commands:${C_RESET}
+  status [--json]           Show daemon health, active scopes, 401 healing counters, and entrypoints
+  doctor                    Run full installation, PATH, TLS, permissions, and hygiene diagnostics
+  logs [N | -f]             Show last N lines of shield.log (default: 40) or follow live with -f
+  start                     Start the background daemon service
+  stop                      Stop the background daemon service
+  restart                   Restart the background daemon service
+  enable-t3 [--yes]         Bind T3 Code Antigravity binaryPath to agy-auth-shield (idempotent)
+  disable-t3                Remove agy-auth-shield binaryPath override from T3 Code settings
+  upgrade [--ref <ref>]     Upgrade in-place from GitHub (${REPO_SLUG})
+  uninstall [options]       Completely remove agy-auth-shield with zero residue
+                            Options: --yes/-y, --keep-logs, --keep-t3
+  version                   Print installed version
+  help                      Show this help message
+EOF
+}
+
+daemon_healthz() {
+  "$CURL_BIN" -fsS --noproxy '*' --max-time 0.8 "${SHIELD_BASE}/__healthz" 2>/dev/null
+}
+
+daemon_status_json() {
+  if [[ -r "$TOKEN_FILE" ]]; then
+    local tok
+    tok="$(tr -d '\r\n' < "$TOKEN_FILE" 2>/dev/null || true)"
+    if [[ -n "$tok" ]]; then
+      "$CURL_BIN" -fsS --noproxy '*' --max-time 2 \
+        -H "X-Shield-Token: ${tok}" \
+        "${SHIELD_BASE}/__status" 2>/dev/null
+      return $?
+    fi
+  fi
+  daemon_healthz
+}
+
+systemd_available() {
+  [[ "$OS_NAME" == "Linux" ]] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && systemctl --user show-environment >/dev/null 2>&1
+}
+
+cmd_status() {
+  local raw_json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) raw_json=1 ;;
+      *) err "Unknown option for status: $1"; return 2 ;;
+    esac
+    shift
+  done
+
+  local payload
+  payload="$(daemon_status_json || true)"
+
+  if [[ "$raw_json" == "1" ]]; then
+    if [[ -n "$payload" ]]; then
+      printf '%s\n' "$payload" | "$PYTHON_BIN" -m json.tool
+      return 0
+    else
+      printf '{"ok":false,"error":"daemon_unreachable","port":%s}\n' "$SHIELD_PORT"
+      return 1
+    fi
+  fi
+
+  printf '%sagy-auth-shield%s v%s\n\n' "$C_BOLD" "$C_RESET" "$(read_version)"
+
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    if /bin/launchctl print "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1; then
+      ok "Service: LaunchAgent loaded (${SERVICE_LABEL})"
+    else
+      warn "Service: LaunchAgent not loaded (${SERVICE_LABEL})"
+    fi
+  elif systemd_available; then
+    if systemctl --user is-active --quiet agy-auth-shield.service 2>/dev/null; then
+      ok "Service: systemd user unit active (agy-auth-shield.service)"
+    else
+      warn "Service: systemd user unit inactive (agy-auth-shield.service)"
+    fi
+  fi
+
+  if [[ -z "$payload" ]]; then
+    err "Daemon: unreachable at ${SHIELD_BASE}"
+    info "Run 'agy-auth-shield start' to start it, or 'agy-auth-shield doctor' to diagnose."
+    return 1
+  fi
+
+  "$PYTHON_BIN" - "$payload" "$SHIELD_BASE" "$WRAPPER_PATH" "$T3_SETTINGS" "$(command -v agy 2>/dev/null || true)" <<'PY'
+import json, os, sys
+
+payload = json.loads(sys.argv[1])
+base_url, wrapper_path, t3_settings, path_agy = sys.argv[2:6]
+
+def fmt_duration(sec):
+    if sec is None:
+        return "never"
+    sec = float(sec)
+    if sec < 60:
+        return f"{sec:.1f}s"
+    if sec < 3600:
+        return f"{int(sec // 60)}m {int(sec % 60)}s"
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    return f"{h}h {m}m"
+
+stats = payload.get("stats") or {}
+healed = stats.get("proactive_swaps", 0) + stats.get("healed_401_cache", 0) + stats.get("healed_401_probe", 0)
+
+print(f"  Daemon:    running (pid {payload.get('pid')}, uptime {fmt_duration(payload.get('uptime_sec'))})")
+print(f"  Endpoint:  {base_url} -> {payload.get('upstream', 'https://daily-cloudcode-pa.googleapis.com:443')}")
+if payload.get("python"):
+    print(f"  Runtime:   Python {payload.get('python')} ({payload.get('openssl', 'ssl')})")
+print()
+print("  Traffic & Healing:")
+print(f"    Requests total:   {stats.get('requests_total', 0)}")
+print(f"    401 prevented:    {healed} (proactive={stats.get('proactive_swaps', 0)}, cache={stats.get('healed_401_cache', 0)}, probe={stats.get('healed_401_probe', 0)})")
+print(f"    Unhealed 401:     {stats.get('unhealed_401', 0)}")
+print(f"    Network retries:  {stats.get('network_retries', 0)}")
+
+scopes = payload.get("scopes") or {}
+print()
+if scopes:
+    print(f"  Active Scopes ({len(scopes)}):")
+    for sid, s in scopes.items():
+        tok_state = f"valid (age {fmt_duration(s.get('token_age_sec'))})" if s.get("has_valid_token") else "no cached token"
+        last_ok = fmt_duration(s.get("last_ok_ago_sec"))
+        print(f"    - {sid} [{s.get('mode', '?')}]: {tok_state}, last ok {last_ok} ago")
+else:
+    print("  Active Scopes: none yet (will register automatically on next `agy` or T3 Code call)")
+
+print()
+print("  Entrypoints:")
+print(f"    PATH `agy`:       {path_agy or '(not found in PATH)'}")
+if os.path.isfile(t3_settings):
+    try:
+        with open(t3_settings, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        bp = (((d.get("providerInstances") or {}).get("antigravity") or {}).get("config") or {}).get("binaryPath")
+        if bp == wrapper_path:
+            t3_desc = f"{bp} (bound)"
+        elif bp:
+            t3_desc = f"{bp} (custom override - not using shield)"
+        else:
+            t3_desc = "(unset -> inherits PATH on T3 startup)"
+    except Exception:
+        t3_desc = "(unreadable)"
+    print(f"    T3 binaryPath:    {t3_desc}")
+else:
+    print("    T3 binaryPath:    (T3 Code settings.json not found)")
+PY
+}
+
+cmd_doctor() {
+  printf '%sagy-auth-shield doctor%s (v%s)\n\n' "$C_BOLD" "$C_RESET" "$(read_version)"
+  local issues=0
+  local warnings=0
+
+  # 1. Python runtime
+  if [[ -x "$DAEMON_LAUNCHER" ]]; then
+    local py_info
+    py_info="$("$PYTHON_BIN" -c 'import ssl, sys; print(f"Python {sys.version.split()[0]} ({ssl.OPENSSL_VERSION})")' 2>/dev/null || true)"
+    if [[ -n "$py_info" ]]; then
+      ok "Python runtime available: ${py_info}"
+    else
+      err "Python 3.9+ with ssl module not found"
+      issues=$((issues + 1))
+    fi
+  else
+    err "Daemon launcher missing at ${DAEMON_LAUNCHER}"
+    issues=$((issues + 1))
+  fi
+
+  # 2. Original `agy` binary
+  local real_agy=""
+  local cand
+  for cand in "$HOME/.local/bin/agy" "/opt/homebrew/bin/agy" "/usr/local/bin/agy" "/usr/bin/agy"; do
+    if [[ -x "$cand" && "$cand" != "$WRAPPER_PATH" ]]; then
+      real_agy="$cand"
+      break
+    fi
+  done
+  if [[ -n "$real_agy" ]]; then
+    local agy_ver
+    agy_ver="$("$real_agy" --version 2>/dev/null | head -n 1 || true)"
+    ok "Real agy binary: ${real_agy} (${agy_ver:-executable})"
+  else
+    warn "Real agy binary not found in standard paths (~/.local/bin/agy). Install Antigravity CLI first."
+    warnings=$((warnings + 1))
+  fi
+
+  # 3. Wrapper precedence in PATH
+  local path_agy
+  path_agy="$(command -v agy 2>/dev/null || true)"
+  if [[ "$path_agy" == "$WRAPPER_PATH" ]]; then
+    ok "PATH resolves 'agy' to shield wrapper (${path_agy})"
+  else
+    warn "PATH resolves 'agy' to '${path_agy:-<none>}' instead of '${WRAPPER_PATH}'"
+    info "Open a new terminal or run: export PATH=\"${SHIELD_HOME}/bin:\$PATH\""
+    warnings=$((warnings + 1))
+  fi
+
+  # 4. Background service & daemon health
+  if daemon_healthz >/dev/null; then
+    ok "Loopback daemon healthy at ${SHIELD_BASE}"
+  else
+    err "Loopback daemon is not responding at ${SHIELD_BASE}"
+    info "Run 'agy-auth-shield start' to launch the daemon."
+    issues=$((issues + 1))
+  fi
+
+  # 5. Control token auth
+  if [[ -r "$TOKEN_FILE" ]]; then
+    local tok
+    tok="$(tr -d '\r\n' < "$TOKEN_FILE" 2>/dev/null || true)"
+    if "$CURL_BIN" -fsS --noproxy '*' --max-time 2 -H "X-Shield-Token: ${tok}" "${SHIELD_BASE}/__status" >/dev/null 2>&1; then
+      ok "Control token authentication verified"
+    else
+      warn "Control token exists but /__status check failed"
+      warnings=$((warnings + 1))
+    fi
+  else
+    warn "Control token missing (${TOKEN_FILE})"
+    warnings=$((warnings + 1))
+  fi
+
+  # 6. Permissions & log hygiene
+  local perm_rc=0
+  "$PYTHON_BIN" - "$SHIELD_HOME" "$TOKEN_FILE" "$LOG_FILE" <<'PY' || perm_rc=$?
+import os, stat, sys
+from pathlib import Path
+
+home, tok, log = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+bad = False
+for p, expected in ((home, 0o700), (home / "run", 0o700), (tok, 0o600)):
+    if p.exists():
+        mode = stat.S_IMODE(p.stat().st_mode)
+        if mode != expected:
+            print(f"PERM_WARN:{p}:{oct(mode)}:{oct(expected)}")
+            bad = True
+if log.is_file():
+    txt = log.read_text(encoding="utf-8", errors="replace")
+    if "ya29." in txt or "Bearer " in txt:
+        print("LEAK_ERR:Sensitive token pattern detected in shield.log")
+        sys.exit(2)
+sys.exit(1 if bad else 0)
+PY
+  if [[ $perm_rc -eq 0 ]]; then
+    ok "Directory/file permissions (0700/0600) and zero-token log hygiene verified"
+  elif [[ $perm_rc -eq 1 ]]; then
+    warn "Some file permissions differ from strict 0700/0600 (fixing automatically is safe: chmod 700 '${SHIELD_HOME}' '${SHIELD_HOME}/run')"
+    warnings=$((warnings + 1))
+  else
+    err "Log hygiene check failed!"
+    issues=$((issues + 1))
+  fi
+
+  # 7. Legacy LaunchAgent check (macOS)
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    local legacy
+    for legacy in "$PLIST_DIR"/com.*.agy-auth-shield.plist; do
+      if [[ -f "$legacy" ]]; then
+        warn "Legacy LaunchAgent plist still present: ${legacy} (re-run install.sh to migrate cleanly)"
+        warnings=$((warnings + 1))
+      fi
+    done
+  fi
+
+  # 8. T3 Code integration status
+  if [[ -f "$T3_SETTINGS" ]]; then
+    local t3_state
+    t3_state="$("$PYTHON_BIN" - "$T3_SETTINGS" "$WRAPPER_PATH" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    d = json.load(f)
+bp = (((d.get("providerInstances") or {}).get("antigravity") or {}).get("config") or {}).get("binaryPath")
+if bp == sys.argv[2]:
+    print("bound")
+elif bp:
+    print("other:" + bp)
+else:
+    print("unset")
+PY
+)"
+    case "$t3_state" in
+      bound)
+        ok "T3 Code Antigravity binaryPath explicitly bound to shield wrapper"
+        ;;
+      unset)
+        info "T3 Code binaryPath is unset (inherits PATH on T3 startup; run 'agy-auth-shield enable-t3' when idle to bind explicitly)"
+        ;;
+      other:*)
+        warn "T3 Code binaryPath points elsewhere: ${t3_state#other:}"
+        warnings=$((warnings + 1))
+        ;;
+    esac
+  else
+    info "T3 Code settings.json not detected (CLI-only mode)"
+  fi
+
+  printf '\n'
+  if [[ $issues -eq 0 && $warnings -eq 0 ]]; then
+    ok "All checks passed."
+    return 0
+  elif [[ $issues -eq 0 ]]; then
+    warn "Completed with ${warnings} warning(s) and 0 errors."
+    return 0
+  else
+    err "Found ${issues} error(s) and ${warnings} warning(s)."
+    return 1
+  fi
+}
+
+cmd_logs() {
+  if [[ "${1:-}" == "-f" || "${1:-}" == "--follow" ]]; then
+    if [[ -f "$LOG_FILE" ]]; then
+      tail -n 40 -f "$LOG_FILE"
+    else
+      err "No log file at ${LOG_FILE}"
+      return 1
+    fi
+    return 0
+  fi
+  local lines="${1:-40}"
+  if [[ -f "$LOG_FILE" ]]; then
+    tail -n "$lines" "$LOG_FILE"
+  else
+    info "No log file at ${LOG_FILE}"
+  fi
+}
+
+wait_for_daemon() {
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if daemon_healthz >/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+cmd_start() {
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    if [[ ! -f "$PLIST_PATH" ]]; then
+      err "Missing LaunchAgent plist: ${PLIST_PATH}"
+      info "Re-run install.sh to recreate it."
+      return 1
+    fi
+    if /bin/launchctl print "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1; then
+      /bin/launchctl kickstart -k "gui/${UID_NUM}/${SERVICE_LABEL}"
+    else
+      /bin/launchctl bootstrap "gui/${UID_NUM}" "$PLIST_PATH"
+    fi
+  elif systemd_available && [[ -f "$SYSTEMD_UNIT" ]]; then
+    systemctl --user start agy-auth-shield.service
+  else
+    if ! daemon_healthz >/dev/null; then
+      nohup "$DAEMON_LAUNCHER" >>"${SHIELD_HOME}/launchd.log" 2>&1 </dev/null &
+    fi
+  fi
+
+  if ! wait_for_daemon; then
+    err "agy-auth-shield did not respond on ${SHIELD_BASE} within 4s"
+    return 1
+  fi
+  ok "agy-auth-shield started on ${SHIELD_BASE}"
+}
+
+stop_daemon_quiet() {
+  # 1. Request graceful shutdown via control endpoint if running
+  if [[ -r "$TOKEN_FILE" && -x "$CURL_BIN" ]]; then
+    local tok
+    tok="$(tr -d '\r\n' < "$TOKEN_FILE" 2>/dev/null || true)"
+    if [[ -n "$tok" ]]; then
+      "$CURL_BIN" -fsS --noproxy '*' --max-time 1 \
+        -X POST \
+        -H "X-Shield-Token: ${tok}" \
+        "${SHIELD_BASE}/__shutdown" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 2. Unload platform service manager so KeepAlive / Restart does not respawn it
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    /bin/launchctl bootout "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1 || true
+    local legacy_plist legacy_label
+    for legacy_plist in "$PLIST_DIR"/com.*.agy-auth-shield.plist; do
+      if [[ -f "$legacy_plist" ]]; then
+        legacy_label="$(basename "$legacy_plist" .plist)"
+        /bin/launchctl bootout "gui/${UID_NUM}/${legacy_label}" >/dev/null 2>&1 || true
+      fi
+    done
+  elif systemd_available; then
+    systemctl --user stop agy-auth-shield.service >/dev/null 2>&1 || true
+  fi
+
+  # 3. Ensure PID recorded in daemon.pid is fully terminated (only if still agy_auth_shield.py)
+  if [[ -r "$PID_FILE" ]]; then
+    local pid cmdline
+    pid="$(tr -d '\r\n' < "$PID_FILE" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      cmdline="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+      if [[ "$cmdline" == *"agy_auth_shield.py"* ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+          kill -0 "$pid" 2>/dev/null || break
+          sleep 0.15
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+          kill -KILL "$pid" 2>/dev/null || true
+        fi
+      fi
+    fi
+  fi
+}
+
+cmd_stop() {
+  stop_daemon_quiet
+  ok "agy-auth-shield stopped"
+}
+
+cmd_restart() {
+  stop_daemon_quiet
+  sleep 0.25
+  cmd_start
+}
+
+cmd_enable_t3() {
+  local auto_yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) auto_yes=1 ;;
+      *) err "Unknown option for enable-t3: $1"; return 2 ;;
+    esac
+    shift
+  done
+
+  if [[ ! -f "$T3_SETTINGS" ]]; then
+    err "T3 Code settings.json not found at ${T3_SETTINGS}"
+    return 1
+  fi
+
+  # Check idempotency first so we never rewrite settings.json unnecessarily.
+  local current_bp
+  current_bp="$("$PYTHON_BIN" - "$T3_SETTINGS" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    d = json.load(f)
+bp = (((d.get("providerInstances") or {}).get("antigravity") or {}).get("config") or {}).get("binaryPath")
+print(bp or "")
+PY
+)"
+  if [[ "$current_bp" == "$WRAPPER_PATH" ]]; then
+    ok "T3 Code binaryPath is already set to ${WRAPPER_PATH} (no changes needed)"
+    return 0
+  fi
+
+  if [[ "$auto_yes" != "1" && -t 0 ]]; then
+    warn "Updating T3 Code settings.json triggers hot-reload and restarts active Antigravity threads."
+    printf 'Continue? [y/N] '
+    local reply
+    read -r reply
+    case "$reply" in
+      y|Y|yes|YES) ;;
+      *) info "Cancelled."; return 0 ;;
+    esac
+  fi
+
+  mkdir -p "${SHIELD_HOME}/backups"
+  chmod 700 "${SHIELD_HOME}/backups"
+  local backup_file="${SHIELD_HOME}/backups/t3-settings.$(date +%Y%m%d%H%M%S).json"
+  cp "$T3_SETTINGS" "$backup_file"
+  chmod 600 "$backup_file"
+
+  "$PYTHON_BIN" - "$T3_SETTINGS" "$WRAPPER_PATH" <<'PY'
+import json, os, stat, sys, tempfile
+settings_path, wrapper_path = sys.argv[1], sys.argv[2]
+st_mode = stat.S_IMODE(os.stat(settings_path).st_mode)
+with open(settings_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+instances = data.setdefault("providerInstances", {})
+ag = instances.setdefault("antigravity", {"driver": "antigravity", "enabled": True})
+cfg = ag.setdefault("config", {})
+cfg["binaryPath"] = wrapper_path
+dir_name = os.path.dirname(settings_path)
+fd, tmp_path = tempfile.mkstemp(prefix=".settings.", suffix=".tmp", dir=dir_name)
+try:
+    os.chmod(tmp_path, st_mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, settings_path)
+except Exception:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
+PY
+  ok "Updated T3 Code settings: binaryPath -> ${WRAPPER_PATH}"
+  info "Backup saved inside ${backup_file}"
+}
+
+disable_t3_if_managed() {
+  if [[ ! -f "$T3_SETTINGS" ]]; then
+    return 0
+  fi
+  "$PYTHON_BIN" - "$T3_SETTINGS" "$WRAPPER_PATH" <<'PY'
+import json, os, stat, sys, tempfile
+settings_path, wrapper_path = sys.argv[1], sys.argv[2]
+st_mode = stat.S_IMODE(os.stat(settings_path).st_mode)
+with open(settings_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+ag = (data.get("providerInstances") or {}).get("antigravity")
+if not isinstance(ag, dict) or not isinstance(ag.get("config"), dict):
+    print("UNCHANGED")
+    raise SystemExit(0)
+bp = ag["config"].get("binaryPath")
+if not bp or (bp != wrapper_path and "agy-auth-shield" not in str(bp)):
+    print("UNCHANGED")
+    raise SystemExit(0)
+ag["config"].pop("binaryPath", None)
+if not ag["config"]:
+    ag.pop("config", None)
+dir_name = os.path.dirname(settings_path)
+fd, tmp_path = tempfile.mkstemp(prefix=".settings.", suffix=".tmp", dir=dir_name)
+try:
+    os.chmod(tmp_path, st_mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, settings_path)
+except Exception:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
+print("REMOVED")
+PY
+}
+
+cmd_disable_t3() {
+  if [[ ! -f "$T3_SETTINGS" ]]; then
+    info "T3 Code settings.json not found at ${T3_SETTINGS}"
+    return 0
+  fi
+  local res
+  res="$(disable_t3_if_managed)"
+  if [[ "$res" == "REMOVED" ]]; then
+    ok "Removed agy-auth-shield binaryPath override from ${T3_SETTINGS}"
+  else
+    info "T3 Code settings.json has no agy-auth-shield binaryPath override (no changes made)"
+  fi
+}
+
+strip_shell_rc_blocks() {
+  "$PYTHON_BIN" - "$HOME" "$SHIELD_HOME" <<'PY'
+import os, stat, sys, tempfile
+from pathlib import Path
+
+home = Path(sys.argv[1])
+shield_home = sys.argv[2]
+
+rc_files = [
+    home / ".zshrc",
+    home / ".zprofile",
+    home / ".zshenv",
+    home / ".bashrc",
+    home / ".bash_profile",
+    home / ".profile",
+    home / ".config" / "fish" / "config.fish",
+]
+
+START_MARK = "# >>> agy-auth-shield initialize >>>"
+END_MARK = "# <<< agy-auth-shield initialize <<<"
+
+def clean_lines(lines):
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        # 1. Managed sentinel block
+        if stripped == START_MARK:
+            i += 1
+            while i < n and lines[i].strip() != END_MARK:
+                i += 1
+            if i < n and lines[i].strip() == END_MARK:
+                i += 1
+            # Remove one immediately preceding blank line if we introduced it
+            if out and out[-1].strip() == "":
+                out.pop()
+            continue
+
+        # 2. Legacy v1.0.0 "# Added by agy-auth-shield..." comment block + PATH line
+        if stripped.startswith("# Added by agy-auth-shield"):
+            j = i + 1
+            while j < n and lines[j].strip().startswith("#"):
+                j += 1
+            if j < n and ("agy-auth-shield" in lines[j] or shield_home in lines[j]):
+                i = j + 1
+                if out and out[-1].strip() == "":
+                    out.pop()
+                continue
+
+        # 3. Any standalone PATH / fish_add_path line referencing agy-auth-shield/bin
+        if ("agy-auth-shield/bin" in lines[i] or f"{shield_home}/bin" in lines[i]) and (
+            "PATH" in lines[i] or "fish_add_path" in lines[i]
+        ):
+            i += 1
+            continue
+
+        out.append(lines[i])
+        i += 1
+
+    # Collapse trailing excessive blank lines while preserving final newline
+    while len(out) >= 2 and out[-1].strip() == "" and out[-2].strip() == "":
+        out.pop()
+    return out
+
+modified = []
+for rc in rc_files:
+    if not rc.is_file() or rc.is_symlink():
+        # Follow symlink safely only if target exists and is regular file
+        if not rc.is_file():
+            continue
+    try:
+        orig_text = rc.read_text(encoding="utf-8")
+    except Exception:
+        continue
+    if "agy-auth-shield" not in orig_text and shield_home not in orig_text:
+        continue
+    orig_lines = orig_text.splitlines(keepends=True)
+    new_lines = clean_lines(orig_lines)
+    new_text = "".join(new_lines)
+    if new_text != orig_text:
+        real_rc = rc.resolve()
+        mode = stat.S_IMODE(real_rc.stat().st_mode)
+        fd, tmp_path = tempfile.mkstemp(prefix=".rc.", suffix=".tmp", dir=str(real_rc.parent))
+        try:
+            os.chmod(tmp_path, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new_text)
+            os.replace(tmp_path, str(real_rc))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        modified.append(str(rc))
+
+for m in modified:
+    print(m)
+PY
+}
+
+cmd_upgrade() {
+  local ref="main"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ref)
+        shift
+        ref="${1:-}"
+        [[ -n "$ref" ]] || { err "--ref requires a value"; return 2; }
+        ;;
+      *)
+        err "Unknown option for upgrade: $1"
+        return 2
+        ;;
+    esac
+    shift
+  done
+
+  local url="https://raw.githubusercontent.com/${REPO_SLUG}/${ref}/install.sh"
+  info "Downloading installer from ${url} ..."
+  local tmp_installer rc=0
+  tmp_installer="$(mktemp -t agy-auth-shield-upgrade.XXXXXX)"
+  "$CURL_BIN" -fsSL "$url" -o "$tmp_installer" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    bash "$tmp_installer" --dir "$SHIELD_HOME" --port "$SHIELD_PORT" --ref "$ref" --yes || rc=$?
+  fi
+  rm -f "$tmp_installer"
+  return "$rc"
+}
+
+cmd_uninstall() {
+  local auto_yes=0
+  local keep_logs=0
+  local keep_t3=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) auto_yes=1 ;;
+      --keep-logs) keep_logs=1 ;;
+      --keep-t3) keep_t3=1 ;;
+      *) err "Unknown option for uninstall: $1"; return 2 ;;
+    esac
+    shift
+  done
+
+  printf '%sagy-auth-shield complete uninstall%s\n\n' "$C_BOLD" "$C_RESET"
+  printf 'This will cleanly remove:\n'
+  printf '  - Running daemon & background service (%s)\n' "$SERVICE_LABEL"
+  if [[ "$keep_t3" != "1" ]]; then
+    printf '  - T3 Code binaryPath override (if pointing to agy-auth-shield)\n'
+  fi
+  printf '  - Shell PATH blocks in ~/.zshrc, ~/.zprofile, ~/.bashrc, ~/.bash_profile, ~/.profile, fish\n'
+  if [[ "$keep_logs" == "1" ]]; then
+    printf '  - Installation files in %s (keeping *.log)\n' "$SHIELD_HOME"
+  else
+    printf '  - Entire installation directory: %s\n' "$SHIELD_HOME"
+  fi
+  printf '\n'
+
+  if [[ "$auto_yes" != "1" && -t 0 ]]; then
+    printf 'Proceed with complete uninstall? [y/N] '
+    local reply
+    read -r reply
+    case "$reply" in
+      y|Y|yes|YES) ;;
+      *) info "Uninstall cancelled."; return 0 ;;
+    esac
+  fi
+
+  # 1. Stop daemon and remove service definitions (including legacy labels)
+  stop_daemon_quiet
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    rm -f "$PLIST_PATH"
+    local legacy_plist
+    for legacy_plist in "$PLIST_DIR"/com.*.agy-auth-shield.plist; do
+      if [[ -f "$legacy_plist" ]]; then
+        rm -f "$legacy_plist"
+      fi
+    done
+    ok "Stopped daemon and removed LaunchAgent plist(s)"
+  elif systemd_available; then
+    systemctl --user disable --now agy-auth-shield.service >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_UNIT"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    ok "Stopped daemon and removed systemd user service"
+  else
+    ok "Stopped daemon"
+  fi
+
+  # 2. Remove T3 Code binaryPath override
+  if [[ "$keep_t3" != "1" ]]; then
+    local t3_res
+    t3_res="$(disable_t3_if_managed || true)"
+    if [[ "$t3_res" == "REMOVED" ]]; then
+      ok "Restored T3 Code settings.json (removed agy-auth-shield binaryPath)"
+    else
+      info "T3 Code settings.json unchanged"
+    fi
+  else
+    info "Skipped T3 Code settings.json (--keep-t3)"
+  fi
+
+  # 3. Clean all shell RC files
+  local cleaned_rcs
+  cleaned_rcs="$(strip_shell_rc_blocks || true)"
+  if [[ -n "$cleaned_rcs" ]]; then
+    local rc_line
+    while IFS= read -r rc_line; do
+      [[ -n "$rc_line" ]] && ok "Cleaned shell config: ${rc_line}"
+    done <<< "$cleaned_rcs"
+  else
+    info "No shell config entries found"
+  fi
+
+  # 4. Safely remove SHIELD_HOME (with strict path guards)
+  if [[ -n "$SHIELD_HOME" && "$SHIELD_HOME" != "/" && "$SHIELD_HOME" != "$HOME" && -d "$SHIELD_HOME" ]]; then
+    if [[ -f "${SHIELD_HOME}/.agy-auth-shield-managed" || -f "${SHIELD_HOME}/agy_auth_shield.py" ]]; then
+      if [[ "$keep_logs" == "1" ]]; then
+        rm -rf "${SHIELD_HOME}/bin" "${SHIELD_HOME}/run" "${SHIELD_HOME}/__pycache__" \
+               "${SHIELD_HOME}/backups" "${SHIELD_HOME}/agy_auth_shield.py" \
+               "${SHIELD_HOME}/VERSION" "${SHIELD_HOME}/config.env" \
+               "${SHIELD_HOME}/.agy-auth-shield-managed"
+        ok "Removed program files (logs preserved in ${SHIELD_HOME})"
+      else
+        rm -rf "$SHIELD_HOME"
+        ok "Deleted installation directory: ${SHIELD_HOME}"
+      fi
+    else
+      warn "Refusing to delete ${SHIELD_HOME}: missing agy-auth-shield marker file"
+    fi
+  fi
+
+  printf '\n'
+  ok "agy-auth-shield has been completely uninstalled."
+  info "Open a new terminal (or run 'exec \$SHELL') to refresh your shell's PATH."
+  return 0
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    status) cmd_status "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    logs) cmd_logs "$@" ;;
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    restart) cmd_restart "$@" ;;
+    enable-t3) cmd_enable_t3 "$@" ;;
+    disable-t3) cmd_disable_t3 "$@" ;;
+    upgrade) cmd_upgrade "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    version|--version|-v) printf 'agy-auth-shield %s\n' "$(read_version)" ;;
+    help|--help|-h) usage ;;
+    *)
+      err "Unknown command: ${cmd}"
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

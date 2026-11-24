@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: ${{ matrix.os }} (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Shell syntax check (bash -n)
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n src/bin/agy
+          bash -n src/bin/agy-auth-shield
+          bash -n src/bin/agy-auth-shield-daemon
+
+      - name: ShellCheck
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -S warning install.sh uninstall.sh src/bin/agy src/bin/agy-auth-shield src/bin/agy-auth-shield-daemon
+          else
+            echo "shellcheck not installed; skipping"
+          fi
+
+      - name: Python bytecode compilation check
+        run: python3 -m py_compile src/agy_auth_shield.py tests/test_daemon.py tests/test_lifecycle.py tests/live_e2e.py
+
+      - name: Run unit, daemon & zero-residue lifecycle tests
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v

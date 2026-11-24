@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# Global Antigravity (`agy`) wrapper shim installed by agy-auth-shield.
+#
+# - Enforces GODEBUG=http2client=0 for both CLI and T3 Code (`agy acp`).
+# - Routes Cloud Code traffic through the local agy-auth-shield loopback gateway
+#   for transparent mid-turn OAuth 401 auto-healing.
+# - Always fails open to the real `agy` binary if the daemon cannot be reached.
+# - Lives outside ~/.local/bin/agy so `agy update` self-updates keep working cleanly.
+
+set -uo pipefail
+
+SHIELD_HOME="${AGY_AUTH_SHIELD_HOME:-$HOME/.local/share/agy-auth-shield}"
+if [[ -r "${SHIELD_HOME}/config.env" ]]; then
+  _caller_port="${AGY_AUTH_SHIELD_PORT:-}"
+  _caller_label="${AGY_AUTH_SHIELD_LABEL:-}"
+  # shellcheck disable=SC1091
+  source "${SHIELD_HOME}/config.env" 2>/dev/null || true
+  [[ -n "$_caller_port" ]] && AGY_AUTH_SHIELD_PORT="$_caller_port"
+  [[ -n "$_caller_label" ]] && AGY_AUTH_SHIELD_LABEL="$_caller_label"
+fi
+
+SHIELD_PORT="${AGY_AUTH_SHIELD_PORT:-18765}"
+SHIELD_HOST="127.0.0.1"
+SHIELD_BASE="http://${SHIELD_HOST}:${SHIELD_PORT}"
+TOKEN_FILE="${SHIELD_HOME}/run/control.token"
+SERVICE_LABEL="${AGY_AUTH_SHIELD_LABEL:-io.github.zs-andy.agy-auth-shield}"
+CURL_BIN="$(command -v curl 2>/dev/null || printf '%s' '/usr/bin/curl')"
+
+# Resolve our own real path so we never recurse into ourselves.
+SELF_PATH="$0"
+SELF_DIR="$(cd "$(dirname "$SELF_PATH")" 2>/dev/null && pwd -P)"
+SELF_REAL="${SELF_DIR}/$(basename "$SELF_PATH")"
+
+find_real_agy() {
+  local cand real_cand
+  if [[ -n "${AGY_AUTH_SHIELD_REAL_AGY:-}" && -x "${AGY_AUTH_SHIELD_REAL_AGY}" ]]; then
+    printf '%s\n' "${AGY_AUTH_SHIELD_REAL_AGY}"
+    return 0
+  fi
+  for cand in "$HOME/.local/bin/agy" "/opt/homebrew/bin/agy" "/usr/local/bin/agy" "/usr/bin/agy"; do
+    if [[ -x "$cand" ]]; then
+      real_cand="$(cd "$(dirname "$cand")" 2>/dev/null && pwd -P)/$(basename "$cand")"
+      if [[ "$real_cand" != "$SELF_REAL" ]]; then
+        printf '%s\n' "$cand"
+        return 0
+      fi
+    fi
+  done
+  local IFS=':'
+  local dir
+  for dir in ${PATH:-}; do
+    [[ -z "$dir" ]] && continue
+    cand="${dir%/}/agy"
+    if [[ -x "$cand" ]]; then
+      real_cand="$(cd "$(dirname "$cand")" 2>/dev/null && pwd -P)/$(basename "$cand")"
+      if [[ "$real_cand" != "$SELF_REAL" ]]; then
+        printf '%s\n' "$cand"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+REAL_AGY="$(find_real_agy || true)"
+if [[ -z "$REAL_AGY" ]]; then
+  echo "agy-auth-shield: could not locate real 'agy' binary. Is Antigravity CLI installed?" >&2
+  exit 127
+fi
+
+# Always ensure HTTP/1.1 (prevents Go HTTP/2 GOAWAY/stream stalls in both CLI and T3 Code).
+if [[ -z "${GODEBUG:-}" ]]; then
+  export GODEBUG="http2client=0"
+elif [[ ",${GODEBUG}," != *",http2client=0,"* ]]; then
+  export GODEBUG="${GODEBUG},http2client=0"
+fi
+
+# Ensure loopback traffic never goes through a user's system HTTP proxy.
+append_no_proxy() {
+  local val="$1"
+  local item
+  for item in "127.0.0.1" "localhost"; do
+    if [[ -z "$val" ]]; then
+      val="$item"
+    elif [[ ",${val}," != *",${item},"* ]]; then
+      val="${val},${item}"
+    fi
+  done
+  printf '%s' "$val"
+}
+NO_PROXY_MERGED="$(append_no_proxy "${NO_PROXY:-${no_proxy:-}}")"
+export NO_PROXY="$NO_PROXY_MERGED"
+export no_proxy="$NO_PROXY_MERGED"
+
+# Explicit opt-out or external custom CLOUD_CODE_URL
+if [[ "${AGY_AUTH_SHIELD_DISABLE:-0}" == "1" ]]; then
+  exec "$REAL_AGY" "$@"
+fi
+if [[ -n "${CLOUD_CODE_URL:-}" && "${CLOUD_CODE_URL}" != "${SHIELD_BASE}/"* ]]; then
+  exec "$REAL_AGY" "$@"
+fi
+
+# Inspect args: fast-path utility/help/login commands & extract ACP scope flags
+FIRST_ARG="${1:-}"
+MODE="cli"
+GEMINI_DIR=""
+APP_DATA_DIR=""
+HAS_CLOUD_ENDPOINT=0
+IS_AUTH_MUTATION=0
+SKIP_SHIELD=0
+
+case "$FIRST_ARG" in
+  -v|--version|version|-h|--help|help|update|install|changelog|plugin|plugins|agent|agents|mcp|completion|doctor)
+    SKIP_SHIELD=1
+    ;;
+  login|logout|auth)
+    IS_AUTH_MUTATION=1
+    SKIP_SHIELD=1
+    ;;
+  acp)
+    MODE="acp"
+    ;;
+esac
+
+if [[ "$SKIP_SHIELD" == "0" ]]; then
+  i=1
+  argc=$#
+  while [[ $i -le $argc ]]; do
+    arg="${!i}"
+    case "$arg" in
+      -h|--help|-v|--version)
+        SKIP_SHIELD=1
+        break
+        ;;
+      --login|--logout)
+        IS_AUTH_MUTATION=1
+        SKIP_SHIELD=1
+        break
+        ;;
+      --cloud_code_endpoint|--cloud-code-endpoint|-cloud_code_endpoint|--cloud_code_endpoint=*|--cloud-code-endpoint=*|-cloud_code_endpoint=*)
+        HAS_CLOUD_ENDPOINT=1
+        ;;
+      --gemini-dir|--gemini_dir|-gemini-dir|-gemini_dir)
+        next_i=$((i + 1))
+        if [[ $next_i -le $argc ]]; then
+          GEMINI_DIR="${!next_i}"
+          i=$next_i
+        fi
+        ;;
+      --gemini-dir=*|--gemini_dir=*|-gemini-dir=*|-gemini_dir=*)
+        GEMINI_DIR="${arg#*=}"
+        ;;
+      --app-data-dir|--app_data_dir|-app-data-dir|-app_data_dir)
+        next_i=$((i + 1))
+        if [[ $next_i -le $argc ]]; then
+          APP_DATA_DIR="${!next_i}"
+          i=$next_i
+        fi
+        ;;
+      --app-data-dir=*|--app_data_dir=*|-app-data-dir=*|-app_data_dir=*)
+        APP_DATA_DIR="${arg#*=}"
+        ;;
+    esac
+    i=$((i + 1))
+  done
+fi
+
+sha256_short() {
+  local input="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$input" | shasum -a 256 | cut -c1-12
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$input" | sha256sum | cut -c1-12
+  elif command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$input" | openssl dgst -sha256 | awk '{print $NF}' | cut -c1-12
+  else
+    python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "$input"
+  fi
+}
+
+# Compute deterministic scope_id from credential-isolating dimensions
+EFFECTIVE_GEMINI_DIR="${GEMINI_DIR:-${GEMINI_HOME:-$HOME/.gemini}}"
+FILE_STORE_FLAG="0"
+if [[ -n "${SSH_CONNECTION:-}" || "${AGY_ACP_FORCE_FILE_STORAGE:-}" == "1" ]]; then
+  FILE_STORE_FLAG="1"
+fi
+SCOPE_KEY="${MODE}|${EFFECTIVE_GEMINI_DIR}|${APP_DATA_DIR}|${FILE_STORE_FLAG}"
+SCOPE_HASH="$(sha256_short "$SCOPE_KEY")"
+SCOPE_ID="${MODE}-${SCOPE_HASH}"
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/}"
+  s="${s//$'\r'/}"
+  s="${s//$'\t'/ }"
+  printf '%s' "$s"
+}
+
+shield_healthy() {
+  [[ -x "$CURL_BIN" ]] || return 1
+  "$CURL_BIN" -fsS --noproxy '*' --max-time 0.35 "${SHIELD_BASE}/__healthz" >/dev/null 2>&1
+}
+
+if [[ "$IS_AUTH_MUTATION" == "1" ]]; then
+  # Clear cached tokens for this scope on login/logout so the new account takes effect immediately.
+  if [[ -r "$TOKEN_FILE" && -x "$CURL_BIN" ]]; then
+    CTRL_TOK="$(tr -d '\r\n' < "$TOKEN_FILE" 2>/dev/null || true)"
+    if [[ -n "$CTRL_TOK" ]]; then
+      "$CURL_BIN" -fsS --noproxy '*' --max-time 0.35 \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -H "X-Shield-Token: ${CTRL_TOK}" \
+        -d "{\"scope_id\":\"$(json_escape "$SCOPE_ID")\"}" \
+        "${SHIELD_BASE}/__reset_scope" >/dev/null 2>&1 || true
+    fi
+  fi
+  unset CLOUD_CODE_URL
+  exec "$REAL_AGY" "$@"
+fi
+
+if [[ "$SKIP_SHIELD" == "1" || "$HAS_CLOUD_ENDPOINT" == "1" ]]; then
+  if [[ "${CLOUD_CODE_URL:-}" == "${SHIELD_BASE}/"* ]]; then
+    unset CLOUD_CODE_URL
+  fi
+  exec "$REAL_AGY" "$@"
+fi
+
+# Ensure daemon is running (auto-start once if down, fail open if still unreachable).
+if ! shield_healthy; then
+  if [[ "${AGY_AUTH_SHIELD_NO_AUTOSTART:-0}" != "1" ]]; then
+    OS_NAME="$(uname -s 2>/dev/null || printf 'unknown')"
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+      UID_NUM="$(id -u)"
+      if /bin/launchctl print "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1; then
+        /bin/launchctl kickstart "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1 || true
+      elif [[ -x "${SHIELD_HOME}/bin/agy-auth-shield-daemon" ]]; then
+        nohup "${SHIELD_HOME}/bin/agy-auth-shield-daemon" >/dev/null 2>&1 </dev/null &
+      fi
+    elif [[ "$OS_NAME" == "Linux" ]] && command -v systemctl >/dev/null 2>&1 && systemctl --user status agy-auth-shield.service >/dev/null 2>&1; then
+      systemctl --user start agy-auth-shield.service >/dev/null 2>&1 || true
+    elif [[ -x "${SHIELD_HOME}/bin/agy-auth-shield-daemon" ]]; then
+      nohup "${SHIELD_HOME}/bin/agy-auth-shield-daemon" >/dev/null 2>&1 </dev/null &
+    fi
+    for _ in 1 2 3 4 5 6 7 8; do
+      sleep 0.15
+      if shield_healthy; then
+        break
+      fi
+    done
+  fi
+fi
+
+if ! shield_healthy; then
+  # Fail open cleanly without blocking agy.
+  if [[ "${CLOUD_CODE_URL:-}" == "${SHIELD_BASE}/"* ]]; then
+    unset CLOUD_CODE_URL
+  fi
+  exec "$REAL_AGY" "$@"
+fi
+
+# Best-effort registration of non-secret probe spec for this scope.
+if [[ -r "$TOKEN_FILE" && -x "$CURL_BIN" ]]; then
+  CTRL_TOK="$(tr -d '\r\n' < "$TOKEN_FILE" 2>/dev/null || true)"
+  if [[ -n "$CTRL_TOK" ]]; then
+    FORCE_BOOL="false"
+    [[ "${AGY_ACP_FORCE_FILE_STORAGE:-}" == "1" ]] && FORCE_BOOL="true"
+    REG_JSON="{\"scope_id\":\"$(json_escape "$SCOPE_ID")\",\"mode\":\"$(json_escape "$MODE")\",\"real_agy\":\"$(json_escape "$REAL_AGY")\",\"gemini_dir\":\"$(json_escape "$GEMINI_DIR")\",\"app_data_dir\":\"$(json_escape "$APP_DATA_DIR")\",\"gemini_home\":\"$(json_escape "${GEMINI_HOME:-}")\",\"ssh_connection\":\"$(json_escape "${SSH_CONNECTION:-}")\",\"force_file_storage\":${FORCE_BOOL}}"
+    "$CURL_BIN" -fsS --noproxy '*' --max-time 0.4 \
+      -X POST \
+      -H "Content-Type: application/json" \
+      -H "X-Shield-Token: ${CTRL_TOK}" \
+      -d "$REG_JSON" \
+      "${SHIELD_BASE}/__register" >/dev/null 2>&1 || true
+  fi
+fi
+
+ENDPOINT="${SHIELD_BASE}/scope/${SCOPE_ID}"
+export CLOUD_CODE_URL="$ENDPOINT"
+
+if [[ "$MODE" == "acp" ]]; then
+  exec "$REAL_AGY" "$@" "--cloud_code_endpoint=${ENDPOINT}"
+else
+  exec "$REAL_AGY" "$@"
+fi
