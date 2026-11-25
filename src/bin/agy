@@ -13,10 +13,12 @@ SHIELD_HOME="${AGY_AUTH_SHIELD_HOME:-$HOME/.local/share/agy-auth-shield}"
 if [[ -r "${SHIELD_HOME}/config.env" ]]; then
   _caller_port="${AGY_AUTH_SHIELD_PORT:-}"
   _caller_label="${AGY_AUTH_SHIELD_LABEL:-}"
+  _caller_no_service="${AGY_AUTH_SHIELD_NO_SERVICE:-}"
   # shellcheck disable=SC1091
   source "${SHIELD_HOME}/config.env" 2>/dev/null || true
   [[ -n "$_caller_port" ]] && AGY_AUTH_SHIELD_PORT="$_caller_port"
   [[ -n "$_caller_label" ]] && AGY_AUTH_SHIELD_LABEL="$_caller_label"
+  [[ -n "$_caller_no_service" ]] && AGY_AUTH_SHIELD_NO_SERVICE="$_caller_no_service"
 fi
 
 SHIELD_PORT="${AGY_AUTH_SHIELD_PORT:-18765}"
@@ -231,14 +233,21 @@ fi
 if ! shield_healthy; then
   if [[ "${AGY_AUTH_SHIELD_NO_AUTOSTART:-0}" != "1" ]]; then
     OS_NAME="$(uname -s 2>/dev/null || printf 'unknown')"
-    if [[ "$OS_NAME" == "Darwin" ]]; then
+    if [[ "${AGY_AUTH_SHIELD_NO_SERVICE:-0}" != "1" && "$OS_NAME" == "Darwin" ]]; then
       UID_NUM="$(id -u)"
-      if /bin/launchctl print "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1; then
+      PLIST_PATH="$HOME/Library/LaunchAgents/${SERVICE_LABEL}.plist"
+      if [[ -f "$PLIST_PATH" ]] \
+        && (grep -Fq "<string>${SHIELD_HOME}</string>" "$PLIST_PATH" || grep -Fq "<string>${SHIELD_HOME}/" "$PLIST_PATH") \
+        && /bin/launchctl print "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1; then
         /bin/launchctl kickstart "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1 || true
       elif [[ -x "${SHIELD_HOME}/bin/agy-auth-shield-daemon" ]]; then
         nohup "${SHIELD_HOME}/bin/agy-auth-shield-daemon" >/dev/null 2>&1 </dev/null &
       fi
-    elif [[ "$OS_NAME" == "Linux" ]] && command -v systemctl >/dev/null 2>&1 && systemctl --user status agy-auth-shield.service >/dev/null 2>&1; then
+    elif [[ "${AGY_AUTH_SHIELD_NO_SERVICE:-0}" != "1" && "$OS_NAME" == "Linux" ]] \
+      && command -v systemctl >/dev/null 2>&1 \
+      && [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/agy-auth-shield.service" ]] \
+      && grep -Fq "AGY_AUTH_SHIELD_HOME=${SHIELD_HOME}" "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/agy-auth-shield.service" \
+      && systemctl --user status agy-auth-shield.service >/dev/null 2>&1; then
       systemctl --user start agy-auth-shield.service >/dev/null 2>&1 || true
     elif [[ -x "${SHIELD_HOME}/bin/agy-auth-shield-daemon" ]]; then
       nohup "${SHIELD_HOME}/bin/agy-auth-shield-daemon" >/dev/null 2>&1 </dev/null &

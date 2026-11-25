@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import gzip
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -66,6 +67,8 @@ class DaemonIntegrationTests(unittest.TestCase):
         self.state_lock = threading.Lock()
         self.valid_tokens = {"tok_v1", "tok_v2"}
         self.eof_once_done = {"done": False}
+        self.path_counts: dict[str, int] = {}
+        self.gzip_seen: list[bool] = []
 
         test_case = self
 
@@ -104,6 +107,35 @@ class DaemonIntegrationTests(unittest.TestCase):
             def do_POST(self):
                 cl = int(self.headers.get("Content-Length") or "0")
                 req_body = self.rfile.read(cl) if cl else b""
+                is_gz = (self.headers.get("Content-Encoding") or "").lower() == "gzip"
+                with test_case.state_lock:
+                    test_case.path_counts[self.path] = test_case.path_counts.get(self.path, 0) + 1
+                    test_case.gzip_seen.append(is_gz)
+
+                if self.path == "/v1internal:rejectGzip" and is_gz:
+                    err = b'{"error":"unsupported Content-Encoding: gzip"}'
+                    self.send_response(415)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    self.wfile.flush()
+                    return
+
+                if is_gz and req_body:
+                    req_body = gzip.decompress(req_body)
+
+                if self.path == "/v1internal:slowHeaders":
+                    time.sleep(2.2)
+                    self.send_response(200)
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(b"{}")
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+                    return
 
                 if self.path == "/v1internal:eofOnce":
                     with test_case.state_lock:
@@ -116,6 +148,10 @@ class DaemonIntegrationTests(unittest.TestCase):
                 tok = self._check_auth()
                 if tok is None:
                     self._send_401()
+                    return
+
+                if self.path == "/v1internal:dropReplay":
+                    self.connection.close()
                     return
 
                 if self.path.startswith("/v1internal:streamGenerateContent"):
@@ -482,6 +518,241 @@ else:
             self.shield_port, "GET", "/__status", headers=self.ctrl_hdrs
         )
         self.assertGreaterEqual(status_after["stats"]["network_retries"], 1)
+
+    def test_large_json_gzip_and_415_fallback(self) -> None:
+        big_text = "hello_context_padding_" * 2000  # ~44 KB compressible JSON
+        st, d = http_json(
+            self.shield_port,
+            "POST",
+            "/scope/cli-gz/v1internal:bigJson",
+            headers={"Authorization": "Bearer tok_v2"},
+            body={"data": big_text},
+        )
+        self.assertEqual(st, 200)
+        self.assertIn("hello_context_padding_", d["echo"])
+        with self.state_lock:
+            self.assertTrue(any(self.gzip_seen), "Expected gzip compression on large JSON body")
+        _, status_mid = http_json(
+            self.shield_port, "GET", "/__status", headers=self.ctrl_hdrs
+        )
+        self.assertGreaterEqual(status_mid["stats"]["gzip_compressed_requests"], 1)
+        self.assertGreater(status_mid["stats"]["gzip_bytes_saved"], 10000)
+
+        # If upstream ever rejects gzip with 415, daemon transparently replays uncompressed & disables gzip
+        st2, d2 = http_json(
+            self.shield_port,
+            "POST",
+            "/scope/cli-gz/v1internal:rejectGzip",
+            headers={"Authorization": "Bearer tok_v2"},
+            body={"data": big_text},
+        )
+        self.assertEqual(st2, 200)
+        self.assertIn("hello_context_padding_", d2["echo"])
+
+    def test_header_read_timeout_does_not_double_retry(self) -> None:
+        # Restart daemon with a short 1s read timeout to verify 504 on header timeout with exactly 1 attempt
+        self._stop_daemon(self.daemon)
+        env = dict(os.environ)
+        env["AGY_AUTH_SHIELD_HOME"] = str(self.shield_home)
+        env["AGY_AUTH_SHIELD_PORT"] = str(self.shield_port)
+        env["AGY_AUTH_SHIELD_UPSTREAM"] = f"http://127.0.0.1:{self.mock_port}"
+        env["AGY_AUTH_SHIELD_READ_TIMEOUT_SEC"] = "1.0"
+        env["NO_PROXY"] = "127.0.0.1,localhost"
+        env["no_proxy"] = "127.0.0.1,localhost"
+        self.daemon = subprocess.Popen(
+            [sys.executable, str(DAEMON_SCRIPT)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(50):
+            try:
+                st, payload = http_json(self.shield_port, "GET", "/__healthz")
+                if st == 200 and payload and payload.get("ok"):
+                    break
+            except Exception:
+                time.sleep(0.08)
+
+        t0 = time.monotonic()
+        st, body = http_json(
+            self.shield_port,
+            "POST",
+            "/scope/cli-timeout/v1internal:slowHeaders",
+            headers={"Authorization": "Bearer tok_v2"},
+            body={"k": 1},
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(st, 504, f"Expected 504 Gateway Timeout, got {st} {body}")
+        self.assertLess(elapsed, 2.0, "Header read timeout must not stack a second retry")
+        with self.state_lock:
+            self.assertEqual(self.path_counts.get("/v1internal:slowHeaders"), 1)
+
+    def test_stale_token_pool_does_not_bypass_probe(self) -> None:
+        # Regression test: 3 previously valid tokens that all expire across hours must
+        # never let the oldest cached token short-circuit Tier-2 probing.
+        self.probe_token_file.write_text("tok_h4_probed\n", encoding="utf-8")
+        with self.state_lock:
+            self.valid_tokens.update({"tok_h1", "tok_h2", "tok_h3"})
+
+        st, _ = http_json(
+            self.shield_port,
+            "POST",
+            "/__register",
+            headers=self.ctrl_hdrs,
+            body={"scope_id": "cli-stale-pool", "mode": "cli", "real_agy": str(self.fake_agy)},
+        )
+        self.assertEqual(st, 200)
+
+        # Warm three sequential tokens so all three enter valid_tokens.
+        for tok in ("tok_h1", "tok_h2", "tok_h3"):
+            st_w, d_w = http_json(
+                self.shield_port,
+                "POST",
+                "/scope/cli-stale-pool/v1internal:call",
+                headers={"Authorization": f"Bearer {tok}"},
+                body={"tok": tok},
+            )
+            self.assertEqual((st_w, d_w["tok"]), (200, tok))
+
+        # Expire all three cached tokens; only the fresh probed token is now accepted.
+        with self.state_lock:
+            self.valid_tokens.difference_update({"tok_h1", "tok_h2", "tok_h3"})
+            self.valid_tokens.add("tok_h4_probed")
+
+        st, d = http_json(
+            self.shield_port,
+            "POST",
+            "/scope/cli-stale-pool/v1internal:call",
+            headers={"Authorization": "Bearer tok_h3"},
+            body={"turn": "after_3h"},
+        )
+        self.assertEqual((st, d.get("tok")), (200, "tok_h4_probed"))
+
+        _, status_after = http_json(
+            self.shield_port, "GET", "/__status", headers=self.ctrl_hdrs
+        )
+        self.assertEqual(status_after["stats"]["probe_attempts"], 1)
+        self.assertEqual(status_after["stats"]["probe_successes"], 1)
+        self.assertEqual(status_after["stats"]["healed_401_probe"], 1)
+        self.assertEqual(status_after["stats"]["unhealed_401"], 0)
+
+    def test_valid_token_ttl_eviction(self) -> None:
+        # Restart daemon with a short valid-token TTL and verify aged cached tokens are
+        # evicted instead of being reused as fresh cache entries.
+        self._stop_daemon(self.daemon)
+        env = dict(os.environ)
+        env["AGY_AUTH_SHIELD_HOME"] = str(self.shield_home)
+        env["AGY_AUTH_SHIELD_PORT"] = str(self.shield_port)
+        env["AGY_AUTH_SHIELD_UPSTREAM"] = f"http://127.0.0.1:{self.mock_port}"
+        env["AGY_AUTH_SHIELD_VALID_TOKEN_TTL_SEC"] = "0.35"
+        env["NO_PROXY"] = "127.0.0.1,localhost"
+        env["no_proxy"] = "127.0.0.1,localhost"
+        self.daemon = subprocess.Popen(
+            [sys.executable, str(DAEMON_SCRIPT)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(50):
+            try:
+                st, payload = http_json(self.shield_port, "GET", "/__healthz")
+                if st == 200 and payload and payload.get("ok"):
+                    break
+            except Exception:
+                time.sleep(0.08)
+
+        self.probe_token_file.write_text("tok_ttl_probed\n", encoding="utf-8")
+        with self.state_lock:
+            self.valid_tokens.add("tok_ttl_probed")
+
+        st, _ = http_json(
+            self.shield_port,
+            "POST",
+            "/__register",
+            headers=self.ctrl_hdrs,
+            body={"scope_id": "cli-ttl", "mode": "cli", "real_agy": str(self.fake_agy)},
+        )
+        self.assertEqual(st, 200)
+
+        # Warm tok_v1, then sleep past TTL so tok_v1 is evicted from valid_tokens.
+        st_w, _ = http_json(
+            self.shield_port,
+            "POST",
+            "/scope/cli-ttl/v1internal:call",
+            headers={"Authorization": "Bearer tok_v1"},
+            body={"k": 1},
+        )
+        self.assertEqual(st_w, 200)
+        time.sleep(0.5)
+
+        st_r, d_r = http_json(
+            self.shield_port,
+            "POST",
+            "/scope/cli-ttl/v1internal:call",
+            headers={"Authorization": "Bearer tok_expired_ttl"},
+            body={"k": 2},
+        )
+        self.assertEqual((st_r, d_r.get("tok")), (200, "tok_ttl_probed"))
+        _, status_after = http_json(
+            self.shield_port, "GET", "/__status", headers=self.ctrl_hdrs
+        )
+        self.assertEqual(status_after["stats"]["healed_401_cache"], 0)
+        self.assertEqual(status_after["stats"]["healed_401_probe"], 1)
+        self.assertEqual(status_after["stats"]["probe_attempts"], 1)
+
+    def test_replay_transport_error_returns_502_not_stale_401(self) -> None:
+        # 1. Tier-1 cache replay hits persistent transport drop -> must return 502, not stale 401.
+        st_w, _ = http_json(
+            self.shield_port,
+            "POST",
+            "/scope/cli-replay-err/v1internal:call",
+            headers={"Authorization": "Bearer tok_v2"},
+            body={"warm": True},
+        )
+        self.assertEqual(st_w, 200)
+
+        st_t1, d_t1 = http_json(
+            self.shield_port,
+            "POST",
+            "/scope/cli-replay-err/v1internal:dropReplay",
+            headers={"Authorization": "Bearer tok_expired_t1"},
+            body={"step": "tier1"},
+        )
+        self.assertEqual(st_t1, 502, f"Expected 502 on Tier-1 replay EOF, got {st_t1} {d_t1}")
+        self.assertIn("upstream_unreachable", d_t1.get("error", ""))
+
+        # 2. Tier-2 probe succeeds, then replay hits transport drop -> must return 502, not stale 401.
+        self.probe_token_file.write_text("tok_probed_fresh\n", encoding="utf-8")
+        with self.state_lock:
+            self.valid_tokens.add("tok_probed_fresh")
+        st_reg, _ = http_json(
+            self.shield_port,
+            "POST",
+            "/__register",
+            headers=self.ctrl_hdrs,
+            body={
+                "scope_id": "cli-probe-replay-err",
+                "mode": "cli",
+                "real_agy": str(self.fake_agy),
+            },
+        )
+        self.assertEqual(st_reg, 200)
+
+        st_t2, d_t2 = http_json(
+            self.shield_port,
+            "POST",
+            "/scope/cli-probe-replay-err/v1internal:dropReplay",
+            headers={"Authorization": "Bearer tok_expired_t2"},
+            body={"step": "tier2"},
+        )
+        self.assertEqual(st_t2, 502, f"Expected 502 on Tier-2 replay EOF, got {st_t2} {d_t2}")
+        self.assertIn("upstream_unreachable", d_t2.get("error", ""))
+
+        _, status_after = http_json(
+            self.shield_port, "GET", "/__status", headers=self.ctrl_hdrs
+        )
+        self.assertEqual(status_after["stats"]["probe_successes"], 1)
+        self.assertEqual(status_after["stats"]["unhealed_401"], 0)
 
 
 if __name__ == "__main__":

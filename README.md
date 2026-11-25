@@ -135,6 +135,11 @@ Choose either method:
 | `AGY_AUTH_SHIELD_HOME` | `~/.local/share/agy-auth-shield` | Override installation & runtime directory |
 | `AGY_AUTH_SHIELD_REAL_AGY` | *(auto-detected)* | Explicitly point wrapper to the underlying `agy` binary |
 | `AGY_AUTH_SHIELD_NO_AUTOSTART` | `0` | Set to `1` to disable automatic daemon startup on `agy` invocation |
+| `AGY_AUTH_SHIELD_NO_SERVICE` | `0` | Set to `1` to skip all `launchctl` / `systemctl --user` service operations (set automatically by `install.sh --no-service`) |
+| `AGY_AUTH_SHIELD_GZIP_REQUESTS` | `1` | Transparently gzip uncompressed JSON request bodies `>= 16 KiB` (auto-disables if upstream returns `415`); set `0` to disable |
+| `AGY_AUTH_SHIELD_WRITE_TIMEOUT_SEC` | `30` | Per-chunk upstream upload stall timeout in seconds |
+| `AGY_AUTH_SHIELD_READ_TIMEOUT_SEC` | `600` | Upstream response header / SSE idle read timeout in seconds |
+| `AGY_AUTH_SHIELD_VALID_TOKEN_TTL_SEC` | `3300` | Max lifetime (seconds) a cached valid token stays eligible for proactive swap or Tier-1 replay |
 
 ## Complete Zero-Residue Uninstall
 

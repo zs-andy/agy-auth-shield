@@ -106,6 +106,7 @@ class LifecycleTests(unittest.TestCase):
             "AGY_AUTH_SHIELD_REAL_AGY",
             "AGY_AUTH_SHIELD_NO_AUTOSTART",
             "AGY_AUTH_SHIELD_LABEL",
+            "AGY_AUTH_SHIELD_NO_SERVICE",
         ):
             env.pop(key, None)
         env["HOME"] = str(self.fake_home)
@@ -113,6 +114,8 @@ class LifecycleTests(unittest.TestCase):
         env["NO_COLOR"] = "1"
         env["AGY_AUTH_SHIELD_HOME"] = str(self.shield_home)
         env["AGY_AUTH_SHIELD_PORT"] = str(self.port)
+        env["AGY_AUTH_SHIELD_LABEL"] = f"io.github.zs-andy.agy-auth-shield.test.{os.getpid()}"
+        env["AGY_AUTH_SHIELD_NO_SERVICE"] = "1"
         env["AGY_AUTH_SHIELD_T3_SETTINGS"] = str(self.t3_settings)
         env["XDG_CONFIG_HOME"] = str(self.fake_home / ".config")
         path_parts = []
@@ -289,6 +292,70 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue((self.shield_home / "shield.log").is_file())
         self.assertFalse((self.shield_home / "bin").exists())
         self.assertFalse((self.shield_home / "agy_auth_shield.py").exists())
+
+    def test_service_isolation_never_clobbers_foreign_install(self) -> None:
+        # Install with --no-service and verify config.env persists AGY_AUTH_SHIELD_NO_SERVICE=1.
+        self._run([BASH_BIN, str(INSTALL_SH), "--no-service", "--yes"])
+        cfg_text = (self.shield_home / "config.env").read_text(encoding="utf-8")
+        self.assertIn("AGY_AUTH_SHIELD_NO_SERVICE=1", cfg_text)
+
+        # Plant foreign LaunchAgent plist and foreign systemd unit belonging to a different home.
+        plist_dir = self.fake_home / "Library" / "LaunchAgents"
+        plist_dir.mkdir(parents=True, exist_ok=True)
+        foreign_plist = plist_dir / "io.github.zs-andy.agy-auth-shield.plist"
+        foreign_plist.write_text(
+            "<plist><dict><key>AGY_AUTH_SHIELD_HOME</key>"
+            "<string>/opt/foreign/agy-auth-shield</string></dict></plist>\n",
+            encoding="utf-8",
+        )
+        systemd_dir = self.fake_home / ".config" / "systemd" / "user"
+        systemd_dir.mkdir(parents=True, exist_ok=True)
+        foreign_unit = systemd_dir / "agy-auth-shield.service"
+        foreign_unit.write_text(
+            "[Service]\nEnvironment=AGY_AUTH_SHIELD_HOME=/opt/foreign/agy-auth-shield\n"
+            "ExecStart=/opt/foreign/agy-auth-shield/bin/agy-auth-shield-daemon\n",
+            encoding="utf-8",
+        )
+
+        # Even if caller forces AGY_AUTH_SHIELD_NO_SERVICE=0 and the default production label,
+        # ownership checks must prevent touching foreign service definitions or host launchd.
+        env = self._env()
+        env["AGY_AUTH_SHIELD_NO_SERVICE"] = "0"
+        env["AGY_AUTH_SHIELD_LABEL"] = "io.github.zs-andy.agy-auth-shield"
+        cli = str(self.shield_home / "bin" / "agy-auth-shield")
+
+        res_stop = subprocess.run(
+            [BASH_BIN, cli, "stop"], env=env, capture_output=True, text=True, timeout=30, check=True
+        )
+        self.assertEqual(res_stop.returncode, 0)
+        self.assertTrue(foreign_plist.is_file())
+        self.assertTrue(foreign_unit.is_file())
+
+        res_un = subprocess.run(
+            [BASH_BIN, cli, "uninstall", "--yes"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        self.assertEqual(res_un.returncode, 0)
+        self.assertFalse(self.shield_home.exists())
+        self.assertTrue(foreign_plist.is_file(), "Uninstall deleted a foreign LaunchAgent plist!")
+        self.assertTrue(foreign_unit.is_file(), "Uninstall deleted a foreign systemd unit!")
+
+        # Standalone uninstall.sh fallback path must enforce the exact same ownership guard.
+        res_fb = subprocess.run(
+            [BASH_BIN, str(UNINSTALL_SH), "--yes"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        self.assertEqual(res_fb.returncode, 0)
+        self.assertTrue(foreign_plist.is_file(), "Fallback uninstall deleted a foreign plist!")
+        self.assertTrue(foreign_unit.is_file(), "Fallback uninstall deleted a foreign unit!")
 
 
 if __name__ == "__main__":

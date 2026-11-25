@@ -133,6 +133,11 @@ T3 Code 会热监听 `~/.t3/userdata/settings.json`，修改 `binaryPath` 会立
 | `AGY_AUTH_SHIELD_HOME` | `~/.local/share/agy-auth-shield` | 覆盖安装与运行时目录 |
 | `AGY_AUTH_SHIELD_REAL_AGY` | *自动探测* | 手动指定原版 `agy` 可执行文件路径 |
 | `AGY_AUTH_SHIELD_NO_AUTOSTART` | `0` | 设为 `1` 时若守护进程未启动则直接 fail-open，不自动拉起 |
+| `AGY_AUTH_SHIELD_NO_SERVICE` | `0` | 设为 `1` 时跳过所有 `launchctl` / `systemctl --user` 服务操作（`install.sh --no-service` 会自动写入） |
+| `AGY_AUTH_SHIELD_GZIP_REQUESTS` | `1` | 对 `>= 16 KiB` 的未压缩 JSON 请求体透明启用 gzip 压缩（遇 `415` 自动降级并关闭）；设为 `0` 可禁用 |
+| `AGY_AUTH_SHIELD_WRITE_TIMEOUT_SEC` | `30` | 上游分块上传的单块写卡死超时（秒） |
+| `AGY_AUTH_SHIELD_READ_TIMEOUT_SEC` | `600` | 上游响应头与 SSE 空闲读超时（秒） |
+| `AGY_AUTH_SHIELD_VALID_TOKEN_TTL_SEC` | `3300` | 内存缓存中有效 token 参与主动替换与一级缓存重放的最大存活时间（秒） |
 
 ## 一键彻底卸载（零残留）
 

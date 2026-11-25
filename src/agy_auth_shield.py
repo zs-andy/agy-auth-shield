@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
+import gzip
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -27,6 +28,7 @@ import os
 from pathlib import Path
 import platform
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -51,7 +53,7 @@ def _load_version() -> str:
                     return val
         except OSError:
             pass
-    return "1.1.0"
+    return "1.2.0"
 
 
 VERSION = _load_version()
@@ -70,12 +72,44 @@ LOG_FILE = BASE_DIR / "shield.log"
 
 MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024  # 64 MiB
 CONNECT_TIMEOUT_SEC = 30.0
+WRITE_STALL_TIMEOUT_SEC = 30.0  # per-chunk upload stall timeout (prevents 10-min frozen writes)
 READ_TIMEOUT_SEC = 600.0  # 10 min for extended thinking / large prefill SSE pauses
+MAX_RETRY_ELAPSED_SEC = 120.0  # never stack retries past 2 min of elapsed time
+MAX_TRANSIENT_RETRIES = 2  # up to 3 total attempts for fast connect/TLS/send resets
+UPLOAD_CHUNK_BYTES = 65536  # 64 KiB upload chunks for stall & disconnect checks
+GZIP_MIN_BODY_BYTES = 16384  # transparently gzip uncompressed JSON bodies >= 16 KiB
+SLOW_LOG_SEND_MS = 5000
+SLOW_LOG_REQ_BYTES = 512 * 1024
 PROBE_TIMEOUT_SEC = 18.0
 PROBE_FAIL_COOLDOWN_SEC = 20.0
+VALID_TOKEN_TTL_SEC = 3300.0  # 55 min (< Google's 60-min OAuth2 lifetime)
 DEAD_TOKEN_TTL_SEC = 7200.0
 MAX_TRACKED_TOKENS = 64
 MAX_VALID_TOKENS = 8
+
+
+class _ClientDisconnected(Exception):
+    """Raised when the local client closed its socket while upstream work is in flight."""
+
+
+def _configure_upstream_socket(sock: socket.socket, timeout_sec: float) -> None:
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPALIVE"):  # macOS
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30)
+        elif hasattr(socket, "TCP_KEEPIDLE"):  # Linux
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except OSError:
+        pass
+    sock.settimeout(timeout_sec)
 
 HOP_BY_HOP_HEADERS = frozenset(
     {
@@ -246,19 +280,30 @@ class ProbeSpec:
     force_file_storage: bool = False
 
 
+@dataclass
+class _ValidTokenEntry:
+    seq: int
+    first_seen: float
+    last_ok: float
+    expires_at: float
+    ok_seq: int
+
+
 class ScopeState:
     """In-memory per-account/per-profile OAuth token state (tokens are never persisted)."""
 
-    def __init__(self, scope_id: str) -> None:
+    def __init__(self, scope_id: str, valid_token_ttl_sec: float = VALID_TOKEN_TTL_SEC) -> None:
         self.scope_id = scope_id
+        self.valid_token_ttl_sec = valid_token_ttl_sec
         self.lock = threading.Lock()
         self.probe_lock = threading.Lock()
         self.token_cond = threading.Condition(self.lock)
 
         self.token_seq: "OrderedDict[str, int]" = OrderedDict()
+        self.token_first_seen: "OrderedDict[str, float]" = OrderedDict()
         self._next_seq = 0
-        # token -> (seq, first_seen_mono, last_ok_mono)
-        self.valid_tokens: "OrderedDict[str, Tuple[int, float, float]]" = OrderedDict()
+        self._next_ok_seq = 0
+        self.valid_tokens: "OrderedDict[str, _ValidTokenEntry]" = OrderedDict()
         # token -> marked_dead_mono
         self.dead_tokens: "OrderedDict[str, float]" = OrderedDict()
 
@@ -270,6 +315,8 @@ class ScopeState:
     def _prune_locked(self, now: float) -> None:
         while len(self.token_seq) > MAX_TRACKED_TOKENS:
             self.token_seq.popitem(last=False)
+        while len(self.token_first_seen) > MAX_TRACKED_TOKENS:
+            self.token_first_seen.popitem(last=False)
         expired_dead = [
             tok for tok, ts in self.dead_tokens.items() if now - ts > DEAD_TOKEN_TTL_SEC
         ]
@@ -277,9 +324,14 @@ class ScopeState:
             self.dead_tokens.pop(tok, None)
         while len(self.dead_tokens) > MAX_TRACKED_TOKENS:
             self.dead_tokens.popitem(last=False)
+        expired_valid = [
+            tok for tok, entry in self.valid_tokens.items() if now > entry.expires_at
+        ]
+        for tok in expired_valid:
+            self.valid_tokens.pop(tok, None)
         while len(self.valid_tokens) > MAX_VALID_TOKENS:
             # Drop the token with the smallest sequence number (oldest).
-            oldest = min(self.valid_tokens.items(), key=lambda kv: kv[1][0])[0]
+            oldest = min(self.valid_tokens.items(), key=lambda kv: kv[1].seq)[0]
             self.valid_tokens.pop(oldest, None)
 
     def _seq_locked(self, token: str) -> int:
@@ -292,19 +344,27 @@ class ScopeState:
             self.token_seq.move_to_end(token)
         return seq
 
-    def _best_valid_locked(self, exclude: Optional[Set[str]] = None) -> Optional[str]:
+    def _best_valid_locked(
+        self, exclude: Optional[Set[str]] = None, min_ok_seq: int = 0
+    ) -> Optional[str]:
         best_tok: Optional[str] = None
         best_key: Tuple[int, float] = (-1, -1.0)
-        for tok, (seq, _first_seen, last_ok) in self.valid_tokens.items():
+        for tok, entry in self.valid_tokens.items():
             if tok in self.dead_tokens:
                 continue
             if exclude and tok in exclude:
                 continue
-            key = (seq, last_ok)
+            if min_ok_seq > 0 and entry.ok_seq <= min_ok_seq:
+                continue
+            key = (entry.seq, entry.last_ok)
             if key > best_key:
                 best_key = key
                 best_tok = tok
         return best_tok
+
+    def current_ok_seq(self) -> int:
+        with self.lock:
+            return self._next_ok_seq
 
     def select_token_for_request(self, req_token: str) -> Tuple[str, bool]:
         """Return (token_to_send, was_proactively_swapped)."""
@@ -317,20 +377,39 @@ class ScopeState:
                 return req_token, False
             if req_token in self.dead_tokens:
                 return best_tok, True
-            best_seq = self.valid_tokens[best_tok][0]
+            best_seq = self.valid_tokens[best_tok].seq
             if req_seq < best_seq:
                 return best_tok, True
             return req_token, False
 
-    def record_ok(self, token: str) -> None:
+    def record_ok(self, token: str, from_probe: bool = False) -> None:
         now = time.monotonic()
         with self.lock:
             seq = self._seq_locked(token)
+            first_seen = self.token_first_seen.get(token)
+            if first_seen is None:
+                first_seen = now
+                self.token_first_seen[token] = first_seen
+            else:
+                self.token_first_seen.move_to_end(token)
             self.dead_tokens.pop(token, None)
-            prev = self.valid_tokens.get(token)
-            first_seen = prev[1] if prev else now
-            self.valid_tokens[token] = (seq, first_seen, now)
-            self.valid_tokens.move_to_end(token)
+            expires_at = first_seen + self.valid_token_ttl_sec
+            if from_probe:
+                # Probe just confirmed this token with upstream right now; allow
+                # immediate capture with a brief grace window even if near TTL.
+                expires_at = max(expires_at, now + min(self.valid_token_ttl_sec, 60.0))
+            self._next_ok_seq += 1
+            if now <= expires_at:
+                self.valid_tokens[token] = _ValidTokenEntry(
+                    seq=seq,
+                    first_seen=first_seen,
+                    last_ok=now,
+                    expires_at=expires_at,
+                    ok_seq=self._next_ok_seq,
+                )
+                self.valid_tokens.move_to_end(token)
+            else:
+                self.valid_tokens.pop(token, None)
             self.last_ok_at = now
             self._prune_locked(now)
             self.token_cond.notify_all()
@@ -339,21 +418,32 @@ class ScopeState:
         now = time.monotonic()
         with self.lock:
             self._seq_locked(token)
-            self.valid_tokens.pop(token, None)
+            dead_entry = self.valid_tokens.pop(token, None)
             self.dead_tokens[token] = now
             self.dead_tokens.move_to_end(token)
+            if dead_entry is not None:
+                # When a previously valid token expires, evict strictly older
+                # cached tokens whose last success predates this token's first sight.
+                stale_older = [
+                    tok
+                    for tok, entry in self.valid_tokens.items()
+                    if entry.seq < dead_entry.seq and entry.last_ok < dead_entry.first_seen
+                ]
+                for tok in stale_older:
+                    self.valid_tokens.pop(tok, None)
             self._prune_locked(now)
 
-    def get_fresh_token(self, exclude: Set[str]) -> Optional[str]:
+    def get_fresh_token(self, exclude: Set[str], min_ok_seq: int = 0) -> Optional[str]:
         now = time.monotonic()
         with self.lock:
             self._prune_locked(now)
-            return self._best_valid_locked(exclude=exclude)
+            return self._best_valid_locked(exclude=exclude, min_ok_seq=min_ok_seq)
 
     def reset_tokens(self) -> None:
         with self.lock:
             self.valid_tokens.clear()
             self.dead_tokens.clear()
+            self.token_first_seen.clear()
             self.last_probe_failed_at = 0.0
 
     def status_summary(self, now: float) -> Dict[str, object]:
@@ -362,7 +452,7 @@ class ScopeState:
             best_tok = self._best_valid_locked()
             token_age: Optional[float] = None
             if best_tok is not None:
-                token_age = round(now - self.valid_tokens[best_tok][1], 1)
+                token_age = round(now - self.valid_tokens[best_tok].first_seen, 1)
             return {
                 "mode": self.probe_spec.mode if self.probe_spec else "unregistered",
                 "has_valid_token": best_tok is not None,
@@ -398,6 +488,26 @@ class ShieldEngine:
         self.ssl_ctx = _build_ssl_context()
         self.started_at = time.monotonic()
 
+        self.write_timeout_sec = max(
+            1.0,
+            float(os.environ.get("AGY_AUTH_SHIELD_WRITE_TIMEOUT_SEC", str(WRITE_STALL_TIMEOUT_SEC))),
+        )
+        self.read_timeout_sec = max(
+            1.0,
+            float(os.environ.get("AGY_AUTH_SHIELD_READ_TIMEOUT_SEC", str(READ_TIMEOUT_SEC))),
+        )
+        self.valid_token_ttl_sec = max(
+            0.05,
+            float(os.environ.get("AGY_AUTH_SHIELD_VALID_TOKEN_TTL_SEC", str(VALID_TOKEN_TTL_SEC))),
+        )
+        self._gzip_lock = threading.Lock()
+        self._gzip_enabled = os.environ.get("AGY_AUTH_SHIELD_GZIP_REQUESTS", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
         self._scopes_lock = threading.Lock()
         self._scopes: Dict[str, ScopeState] = {}
         self._persist_lock = threading.Lock()
@@ -413,8 +523,20 @@ class ShieldEngine:
             "probe_successes": 0,
             "probe_failures": 0,
             "network_retries": 0,
+            "gzip_compressed_requests": 0,
+            "gzip_bytes_saved": 0,
+            "client_aborts": 0,
+            "write_timeouts": 0,
         }
         self._load_persisted_specs()
+
+    def is_gzip_enabled(self) -> bool:
+        with self._gzip_lock:
+            return self._gzip_enabled
+
+    def disable_gzip(self) -> None:
+        with self._gzip_lock:
+            self._gzip_enabled = False
 
     def _load_persisted_specs(self) -> None:
         """Restore non-secret ProbeSpecs across daemon restarts so active sessions can still heal."""
@@ -493,7 +615,7 @@ class ShieldEngine:
         with self._scopes_lock:
             st = self._scopes.get(scope_id)
             if st is None:
-                st = ScopeState(scope_id)
+                st = ScopeState(scope_id, valid_token_ttl_sec=self.valid_token_ttl_sec)
                 self._scopes[scope_id] = st
             return st
 
@@ -574,11 +696,7 @@ class ShieldEngine:
                     )
                 conn.connect()
                 if conn.sock is not None:
-                    try:
-                        conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    except OSError:
-                        pass
-                    conn.sock.settimeout(READ_TIMEOUT_SEC)
+                    _configure_upstream_socket(conn.sock, self.write_timeout_sec)
                 return conn
             else:
                 self.logger.warning(
@@ -600,11 +718,7 @@ class ShieldEngine:
             )
         conn.connect()
         if conn.sock is not None:
-            try:
-                conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except OSError:
-                pass
-            conn.sock.settimeout(READ_TIMEOUT_SEC)
+            _configure_upstream_socket(conn.sock, self.write_timeout_sec)
         return conn
 
     def _build_probe_env(self, spec: ProbeSpec, probe_url: str, tmpdir: str) -> Dict[str, str]:
@@ -646,7 +760,11 @@ class ShieldEngine:
         return env
 
     def _run_probe_subprocess(
-        self, scope: ScopeState, spec: ProbeSpec, failed_tokens: Set[str]
+        self,
+        scope: ScopeState,
+        spec: ProbeSpec,
+        failed_tokens: Set[str],
+        min_ok_seq: int = 0,
     ) -> Optional[str]:
         probe_url = f"http://{DEFAULT_HOST}:{self.port}/probe/{scope.scope_id}"
         tmpdir = tempfile.mkdtemp(prefix="agy-shield-probe-")
@@ -741,11 +859,14 @@ class ShieldEngine:
             deadline = time.monotonic() + PROBE_TIMEOUT_SEC
             with scope.lock:
                 while True:
-                    fresh = scope._best_valid_locked(exclude=failed_tokens)
+                    scope._prune_locked(time.monotonic())
+                    fresh = scope._best_valid_locked(exclude=failed_tokens, min_ok_seq=min_ok_seq)
                     if fresh is not None:
                         return fresh
                     if proc_exited.is_set():
-                        return scope._best_valid_locked(exclude=failed_tokens)
+                        return scope._best_valid_locked(
+                            exclude=failed_tokens, min_ok_seq=min_ok_seq
+                        )
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return None
@@ -777,10 +898,12 @@ class ShieldEngine:
                             pass
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def ensure_fresh_token(self, scope: ScopeState, failed_tokens: Set[str]) -> Optional[str]:
+    def ensure_fresh_token(
+        self, scope: ScopeState, failed_tokens: Set[str], min_ok_seq: int = 0
+    ) -> Optional[str]:
         """Singleflight per-scope on-demand OAuth refresh via official `agy` probe."""
         with scope.probe_lock:
-            existing = scope.get_fresh_token(exclude=failed_tokens)
+            existing = scope.get_fresh_token(exclude=failed_tokens, min_ok_seq=min_ok_seq)
             if existing is not None:
                 return existing
 
@@ -806,7 +929,7 @@ class ShieldEngine:
             self.inc_stat("probe_attempts")
             t0 = time.monotonic()
             self.logger.info("probe_start scope=%s mode=%s", scope.scope_id, spec.mode)
-            fresh = self._run_probe_subprocess(scope, spec, failed_tokens)
+            fresh = self._run_probe_subprocess(scope, spec, failed_tokens, min_ok_seq=min_ok_seq)
             elapsed_ms = int((time.monotonic() - t0) * 1000)
 
             if fresh is not None:
@@ -910,13 +1033,16 @@ class ShieldRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, payload: Dict[str, object]) -> None:
         body = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-        self.wfile.flush()
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.close_connection = True
 
     def _check_control_auth(self) -> bool:
         got = self.headers.get("X-Shield-Token", "")
@@ -1037,8 +1163,51 @@ class ShieldRequestHandler(BaseHTTPRequestHandler):
 
         return False
 
+    def _is_client_alive(self) -> bool:
+        """Non-blocking check whether the local client socket is still open."""
+        sock = self.connection
+        if sock is None:
+            return False
+        try:
+            rlist, _, _ = select.select([sock], [], [], 0.0)
+            if not rlist:
+                return True
+            peek_flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
+            peek = sock.recv(1, peek_flags)
+            return len(peek) > 0
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+
+    def _maybe_compress_body(self, body: bytes) -> Tuple[bytes, bool]:
+        """Transparently gzip large uncompressed JSON bodies to slash slow-proxy upload time."""
+        engine = self.server.engine
+        if (
+            not body
+            or len(body) < GZIP_MIN_BODY_BYTES
+            or not engine.is_gzip_enabled()
+            or self.command not in ("POST", "PUT", "PATCH")
+        ):
+            return body, False
+        if self.headers.get("Content-Encoding"):
+            return body, False
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        if "json" not in ctype:
+            return body, False
+        try:
+            compressed = gzip.compress(body, compresslevel=1)
+        except Exception:
+            return body, False
+        if len(compressed) < int(len(body) * 0.92):
+            return compressed, True
+        return body, False
+
     def _build_upstream_headers(
-        self, body: bytes, override_bearer: Optional[str]
+        self,
+        body: bytes,
+        override_bearer: Optional[str],
+        gzip_encoded: bool = False,
     ) -> Dict[str, str]:
         req_items = list(self.headers.items())
         hop = _extract_hop_by_hop(req_items)
@@ -1059,29 +1228,130 @@ class ShieldRequestHandler(BaseHTTPRequestHandler):
                 continue
             if override_bearer is not None and kl == "authorization":
                 continue
+            if gzip_encoded and kl == "content-encoding":
+                continue
             out[k] = v
         out["Host"] = host_val
         if override_bearer is not None:
             out["Authorization"] = f"Bearer {override_bearer}"
+        if gzip_encoded:
+            out["Content-Encoding"] = "gzip"
         if body or self.command in ("POST", "PUT", "PATCH"):
             out["Content-Length"] = str(len(body))
         out["Connection"] = "close"
         return out
 
     def _send_upstream_once(
-        self, upstream_path: str, body: bytes, override_bearer: Optional[str]
+        self,
+        upstream_path: str,
+        body: bytes,
+        override_bearer: Optional[str],
+        allow_gzip: bool = True,
     ) -> Tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
         engine = self.server.engine
-        headers = self._build_upstream_headers(body, override_bearer)
+        wire_body, gzip_used = (
+            self._maybe_compress_body(body) if allow_gzip else (body, False)
+        )
+        headers = self._build_upstream_headers(
+            wire_body, override_bearer, gzip_encoded=gzip_used
+        )
         full_path = engine.upstream_base_path + upstream_path
+        log_path = upstream_path.split("?", 1)[0]
+        start_mono = time.monotonic()
         last_exc: Optional[Exception] = None
-        for attempt in range(2):
+
+        for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+            if not self._is_client_alive():
+                raise _ClientDisconnected()
             conn: Optional[http.client.HTTPConnection] = None
+            stage = "connect"
+            t_attempt = time.monotonic()
+            send_ms = 0
             try:
                 conn = engine.open_upstream_connection()
-                conn.request(self.command, full_path, body=body if body else None, headers=headers)
+                stage = "send"
+                conn.putrequest(self.command, full_path, skip_host=True, skip_accept_encoding=True)
+                for hk, hv in headers.items():
+                    conn.putheader(hk, hv)
+                conn.endheaders()
+                if wire_body:
+                    view = memoryview(wire_body)
+                    total_wire = len(wire_body)
+                    offset = 0
+                    while offset < total_wire:
+                        if offset > 0 and not self._is_client_alive():
+                            raise _ClientDisconnected()
+                        end = min(offset + UPLOAD_CHUNK_BYTES, total_wire)
+                        conn.send(view[offset:end])
+                        offset = end
+                send_ms = int((time.monotonic() - t_attempt) * 1000)
+                if conn.sock is not None:
+                    conn.sock.settimeout(engine.read_timeout_sec)
+                stage = "headers"
                 resp = conn.getresponse()
+
+                # Auto-fallback if upstream ever rejects Content-Encoding: gzip
+                if gzip_used and resp.status in (400, 415):
+                    err_probe = b""
+                    try:
+                        err_probe = resp.read(4096)
+                    except Exception:
+                        pass
+                    low_err = err_probe.decode("utf-8", errors="ignore").lower()
+                    if resp.status == 415 or any(
+                        tok in low_err for tok in ("gzip", "content-encoding", "encoding", "decompress")
+                    ):
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        engine.disable_gzip()
+                        engine.logger.warning(
+                            "gzip_fallback_disabled path=%s status=%d req_bytes=%d wire_bytes=%d",
+                            log_path,
+                            resp.status,
+                            len(body),
+                            len(wire_body),
+                        )
+                        return self._send_upstream_once(
+                            upstream_path, body, override_bearer, allow_gzip=False
+                        )
+                    # Put back buffered 400 body via fresh uncompressed retry only if not gzip-related:
+                    # instead, return an already-read failure only if needed; simplest & safest:
+                    # replay uncompressed once on 400 when gzip was added by us so we never lose the body.
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return self._send_upstream_once(
+                        upstream_path, body, override_bearer, allow_gzip=False
+                    )
+
+                if gzip_used:
+                    engine.inc_stat("gzip_compressed_requests")
+                    engine.inc_stat("gzip_bytes_saved", max(0, len(body) - len(wire_body)))
+
+                total_ms = int((time.monotonic() - start_mono) * 1000)
+                if send_ms >= SLOW_LOG_SEND_MS or len(body) >= SLOW_LOG_REQ_BYTES:
+                    engine.logger.info(
+                        "upstream_req path=%s status=%d req_bytes=%d wire_bytes=%d gzip=%d send_ms=%d ttfb_ms=%d attempts=%d",
+                        log_path,
+                        resp.status,
+                        len(body),
+                        len(wire_body),
+                        1 if gzip_used else 0,
+                        send_ms,
+                        total_ms,
+                        attempt + 1,
+                    )
                 return conn, resp
+            except _ClientDisconnected:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                raise
             except (
                 http.client.RemoteDisconnected,
                 http.client.BadStatusLine,
@@ -1096,13 +1366,29 @@ class ShieldRequestHandler(BaseHTTPRequestHandler):
                         conn.close()
                     except Exception:
                         pass
-                if attempt == 0:
+                if isinstance(exc, TimeoutError) and stage == "send":
+                    engine.inc_stat("write_timeouts")
+                elapsed = time.monotonic() - start_mono
+                # Never blindly retry after a full header read timeout (e.g. 600s) or dead client
+                can_retry = (
+                    attempt < MAX_TRANSIENT_RETRIES
+                    and not (isinstance(exc, TimeoutError) and stage == "headers")
+                    and elapsed < MAX_RETRY_ELAPSED_SEC
+                    and self._is_client_alive()
+                )
+                if can_retry:
                     engine.inc_stat("network_retries")
                     engine.logger.warning(
-                        "net_retry path=%s err=%s",
-                        upstream_path.split("?", 1)[0],
+                        "net_retry path=%s stage=%s attempt=%d req_bytes=%d wire_bytes=%d elapsed_ms=%d err=%s",
+                        log_path,
+                        stage,
+                        attempt + 1,
+                        len(body),
+                        len(wire_body),
+                        int(elapsed * 1000),
                         type(exc).__name__,
                     )
+                    time.sleep(0.3 * (attempt + 1))
                     continue
                 raise
             except Exception:
@@ -1187,6 +1473,23 @@ class ShieldRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _stream_response_safely(
+        self,
+        conn: http.client.HTTPConnection,
+        resp: http.client.HTTPResponse,
+        scope_id: str,
+        log_path: str,
+    ) -> None:
+        try:
+            self._stream_response_to_client(conn, resp)
+        except Exception as exc:
+            self.server.engine.logger.warning(
+                "stream_error scope=%s path=%s err=%s",
+                scope_id,
+                log_path,
+                type(exc).__name__,
+            )
+
     def _send_buffered_response(
         self, status: int, reason: str, headers: List[Tuple[str, str]], body: bytes
     ) -> None:
@@ -1240,22 +1543,39 @@ class ShieldRequestHandler(BaseHTTPRequestHandler):
             conn, resp = self._send_upstream_once(
                 upstream_path, body, attempt_token if proactively_swapped else None
             )
-        except Exception as exc:
-            engine.logger.warning(
-                "upstream_error scope=%s path=%s err=%s",
+        except _ClientDisconnected:
+            engine.inc_stat("client_aborts")
+            engine.logger.info(
+                "client_aborted scope=%s path=%s req_bytes=%d elapsed_ms=%d",
                 scope_id,
                 log_path,
+                len(body),
+                int((time.monotonic() - t0) * 1000),
+            )
+            self.close_connection = True
+            return
+        except Exception as exc:
+            engine.logger.warning(
+                "upstream_error scope=%s path=%s req_bytes=%d elapsed_ms=%d err=%s",
+                scope_id,
+                log_path,
+                len(body),
+                int((time.monotonic() - t0) * 1000),
                 type(exc).__name__,
             )
             self.close_connection = True
-            self._send_json(502, {"error": f"upstream_unreachable:{type(exc).__name__}"})
+            status_code = 504 if isinstance(exc, TimeoutError) else 502
+            try:
+                self._send_json(status_code, {"error": f"upstream_unreachable:{type(exc).__name__}"})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
 
         # Fast path: success or non-401 or probe request or unauthenticated request
         if resp.status != 401 or not attempt_token or is_probe:
             if attempt_token:
                 if 200 <= resp.status < 300:
-                    scope.record_ok(attempt_token)
+                    scope.record_ok(attempt_token, from_probe=is_probe)
                     if is_probe:
                         engine.logger.info(
                             "probe_token_captured scope=%s path=%s status=%d",
@@ -1265,15 +1585,7 @@ class ShieldRequestHandler(BaseHTTPRequestHandler):
                         )
                 elif resp.status == 401:
                     scope.record_dead(attempt_token)
-            try:
-                self._stream_response_to_client(conn, resp)
-            except Exception as exc:
-                engine.logger.warning(
-                    "stream_error scope=%s path=%s err=%s",
-                    scope_id,
-                    log_path,
-                    type(exc).__name__,
-                )
+            self._stream_response_safely(conn, resp, scope_id, log_path)
             return
 
         # Reactive 401 healing path
@@ -1290,78 +1602,120 @@ class ShieldRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+        # Snapshot ok_seq before Tier 1/2 so older stale cached tokens can never
+        # short-circuit Tier 2 probing, while newer tokens arriving concurrently
+        # (including singleflight probe peers) are still reused immediately.
+        since_ok_seq = scope.current_ok_seq()
+
         failed_tokens: Set[str] = {attempt_token}
         scope.record_dead(attempt_token)
         if req_token and req_token != attempt_token:
             failed_tokens.add(req_token)
             scope.record_dead(req_token)
 
+        if not self._is_client_alive():
+            engine.inc_stat("client_aborts")
+            self.close_connection = True
+            return
+
         # Tier 1: Try another already-known non-dead valid token in this scope
         alt_token = scope.get_fresh_token(exclude=failed_tokens)
         if alt_token is not None:
             try:
                 rconn, rresp = self._send_upstream_once(upstream_path, body, alt_token)
-                if rresp.status != 401:
-                    if 200 <= rresp.status < 300:
-                        scope.record_ok(alt_token)
-                    engine.inc_stat("healed_401_cache")
-                    engine.logger.info(
-                        "heal_401_cache scope=%s path=%s status=%d elapsed_ms=%d",
-                        scope_id,
-                        log_path,
-                        rresp.status,
-                        int((time.monotonic() - t0) * 1000),
-                    )
-                    self._stream_response_to_client(rconn, rresp)
-                    return
-                try:
-                    rresp.read()
-                except Exception:
-                    pass
-                finally:
-                    rconn.close()
-                failed_tokens.add(alt_token)
-                scope.record_dead(alt_token)
-            except Exception as exc:
-                engine.logger.warning(
-                    "heal_cache_retry_err scope=%s path=%s err=%s",
-                    scope_id,
-                    log_path,
-                    type(exc).__name__,
-                )
-
-        # Tier 2: Singleflight on-demand official `agy` probe
-        fresh_token = engine.ensure_fresh_token(scope, failed_tokens)
-        if fresh_token is not None:
-            try:
-                pconn, presp = self._send_upstream_once(upstream_path, body, fresh_token)
-                if presp.status != 401:
-                    if 200 <= presp.status < 300:
-                        scope.record_ok(fresh_token)
-                    engine.inc_stat("healed_401_probe")
-                    engine.logger.info(
-                        "heal_401_probe scope=%s path=%s status=%d elapsed_ms=%d",
-                        scope_id,
-                        log_path,
-                        presp.status,
-                        int((time.monotonic() - t0) * 1000),
-                    )
-                    self._stream_response_to_client(pconn, presp)
-                    return
-                scope.record_dead(fresh_token)
-                engine.inc_stat("unhealed_401")
-                engine.logger.warning(
-                    "unhealed_401_after_probe scope=%s path=%s", scope_id, log_path
-                )
-                self._stream_response_to_client(pconn, presp)
+            except _ClientDisconnected:
+                engine.inc_stat("client_aborts")
+                self.close_connection = True
                 return
             except Exception as exc:
                 engine.logger.warning(
-                    "heal_probe_retry_err scope=%s path=%s err=%s",
+                    "heal_cache_retry_err scope=%s path=%s elapsed_ms=%d err=%s",
                     scope_id,
                     log_path,
+                    int((time.monotonic() - t0) * 1000),
                     type(exc).__name__,
                 )
+                self.close_connection = True
+                status_code = 504 if isinstance(exc, TimeoutError) else 502
+                self._send_json(status_code, {"error": f"upstream_unreachable:{type(exc).__name__}"})
+                return
+
+            if rresp.status != 401:
+                if 200 <= rresp.status < 300:
+                    scope.record_ok(alt_token)
+                engine.inc_stat("healed_401_cache")
+                engine.logger.info(
+                    "heal_401_cache scope=%s path=%s status=%d elapsed_ms=%d",
+                    scope_id,
+                    log_path,
+                    rresp.status,
+                    int((time.monotonic() - t0) * 1000),
+                )
+                self._stream_response_safely(rconn, rresp, scope_id, log_path)
+                return
+            try:
+                rresp.read()
+            except Exception:
+                pass
+            finally:
+                try:
+                    rconn.close()
+                except Exception:
+                    pass
+            failed_tokens.add(alt_token)
+            scope.record_dead(alt_token)
+
+        if not self._is_client_alive():
+            engine.inc_stat("client_aborts")
+            self.close_connection = True
+            return
+
+        # Tier 2: Singleflight on-demand official `agy` probe
+        fresh_token = engine.ensure_fresh_token(scope, failed_tokens, min_ok_seq=since_ok_seq)
+        if not self._is_client_alive():
+            engine.inc_stat("client_aborts")
+            self.close_connection = True
+            return
+        if fresh_token is not None:
+            try:
+                pconn, presp = self._send_upstream_once(upstream_path, body, fresh_token)
+            except _ClientDisconnected:
+                engine.inc_stat("client_aborts")
+                self.close_connection = True
+                return
+            except Exception as exc:
+                engine.logger.warning(
+                    "heal_probe_retry_err scope=%s path=%s elapsed_ms=%d err=%s",
+                    scope_id,
+                    log_path,
+                    int((time.monotonic() - t0) * 1000),
+                    type(exc).__name__,
+                )
+                self.close_connection = True
+                status_code = 504 if isinstance(exc, TimeoutError) else 502
+                self._send_json(status_code, {"error": f"upstream_unreachable:{type(exc).__name__}"})
+                return
+
+            if presp.status != 401:
+                if 200 <= presp.status < 300:
+                    scope.record_ok(fresh_token)
+                engine.inc_stat("healed_401_probe")
+                engine.logger.info(
+                    "heal_401_probe scope=%s path=%s status=%d elapsed_ms=%d",
+                    scope_id,
+                    log_path,
+                    presp.status,
+                    int((time.monotonic() - t0) * 1000),
+                )
+                self._stream_response_safely(pconn, presp, scope_id, log_path)
+                return
+            scope.record_dead(fresh_token)
+            engine.inc_stat("unhealed_401")
+            engine.logger.warning(
+                "unhealed_401_after_probe scope=%s path=%s", scope_id, log_path
+            )
+            self._stream_response_safely(pconn, presp, scope_id, log_path)
+            return
 
         engine.inc_stat("unhealed_401")
         engine.logger.warning(
@@ -1370,7 +1724,10 @@ class ShieldRequestHandler(BaseHTTPRequestHandler):
             log_path,
             int((time.monotonic() - t0) * 1000),
         )
-        self._send_buffered_response(orig_status, orig_reason, orig_headers, orig_body)
+        try:
+            self._send_buffered_response(orig_status, orig_reason, orig_headers, orig_body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.close_connection = True
 
     def do_GET(self) -> None:
         self._proxy_request()

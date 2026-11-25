@@ -57,20 +57,46 @@ OS_NAME="$(uname -s 2>/dev/null || printf 'unknown')"
 UID_NUM="$(id -u)"
 PYTHON_BIN="$(command -v python3 2>/dev/null || printf '%s' '/usr/bin/python3')"
 
-if [[ "$OS_NAME" == "Darwin" ]]; then
-  PLIST_DIR="$HOME/Library/LaunchAgents"
-  /bin/launchctl bootout "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1 || true
-  rm -f "${PLIST_DIR}/${SERVICE_LABEL}.plist"
-  for legacy in "$PLIST_DIR"/com.*.agy-auth-shield.plist; do
-    if [[ -f "$legacy" ]]; then
-      /bin/launchctl bootout "gui/${UID_NUM}/$(basename "$legacy" .plist)" >/dev/null 2>&1 || true
-      rm -f "$legacy"
+if [[ "${AGY_AUTH_SHIELD_NO_SERVICE:-0}" != "1" ]]; then
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    PLIST_DIR="$HOME/Library/LaunchAgents"
+    PLIST_PATH="${PLIST_DIR}/${SERVICE_LABEL}.plist"
+    _plist_owned=0
+    if [[ -f "$PLIST_PATH" ]] && (grep -Fq "<string>${SHIELD_HOME}</string>" "$PLIST_PATH" || grep -Fq "<string>${SHIELD_HOME}/" "$PLIST_PATH"); then
+      _plist_owned=1
     fi
-  done
-elif [[ "$OS_NAME" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; then
-  systemctl --user disable --now agy-auth-shield.service >/dev/null 2>&1 || true
-  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/agy-auth-shield.service"
-  systemctl --user daemon-reload >/dev/null 2>&1 || true
+    _job_out="$(/bin/launchctl print "gui/${UID_NUM}/${SERVICE_LABEL}" 2>/dev/null || true)"
+    if [[ "$_plist_owned" == "1" || "$_job_out" == *"${SHIELD_HOME}/"* || "$_job_out" == *"AGY_AUTH_SHIELD_HOME => ${SHIELD_HOME}"* ]]; then
+      /bin/launchctl bootout "gui/${UID_NUM}/${SERVICE_LABEL}" >/dev/null 2>&1 || true
+    fi
+    if [[ "$_plist_owned" == "1" ]]; then
+      rm -f "$PLIST_PATH"
+    fi
+    for legacy in "$PLIST_DIR"/com.*.agy-auth-shield.plist; do
+      if [[ -f "$legacy" ]] && (grep -Fq "<string>${SHIELD_HOME}</string>" "$legacy" || grep -Fq "<string>${SHIELD_HOME}/" "$legacy"); then
+        /bin/launchctl bootout "gui/${UID_NUM}/$(basename "$legacy" .plist)" >/dev/null 2>&1 || true
+        rm -f "$legacy"
+      fi
+    done
+  elif [[ "$OS_NAME" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; then
+    UNIT_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/agy-auth-shield.service"
+    _unit_owned=0
+    if [[ -f "$UNIT_PATH" ]]; then
+      if grep -Fxq "Environment=AGY_AUTH_SHIELD_HOME=${SHIELD_HOME}" "$UNIT_PATH" || grep -Fq "ExecStart=${SHIELD_HOME}/" "$UNIT_PATH"; then
+        _unit_owned=1
+      fi
+    else
+      _show_out="$(systemctl --user show -p ExecStart -p Environment agy-auth-shield.service 2>/dev/null || true)"
+      if [[ "$_show_out" == *"${SHIELD_HOME}/"* || "$_show_out" == *"AGY_AUTH_SHIELD_HOME=${SHIELD_HOME}"* ]]; then
+        _unit_owned=1
+      fi
+    fi
+    if [[ "$_unit_owned" == "1" ]]; then
+      systemctl --user disable --now agy-auth-shield.service >/dev/null 2>&1 || true
+      rm -f "$UNIT_PATH"
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
 fi
 
 if command -v "$PYTHON_BIN" >/dev/null 2>&1 || [[ -x "$PYTHON_BIN" ]]; then

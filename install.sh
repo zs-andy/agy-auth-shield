@@ -19,6 +19,9 @@ T3_SETTINGS="${AGY_AUTH_SHIELD_T3_SETTINGS:-$HOME/.t3/userdata/settings.json}"
 OPT_ENABLE_T3=0
 OPT_NO_PATH=0
 OPT_NO_SERVICE=0
+if [[ "${AGY_AUTH_SHIELD_NO_SERVICE:-0}" == "1" ]]; then
+  OPT_NO_SERVICE=1
+fi
 OPT_DRY_RUN=0
 OPT_YES=0
 
@@ -159,7 +162,7 @@ else
   fi
 fi
 
-INSTALL_VERSION="1.1.0"
+INSTALL_VERSION="1.2.0"
 if [[ -n "$SRC_ROOT" && -r "${SRC_ROOT}/VERSION" ]]; then
   INSTALL_VERSION="$(tr -d '\r\n' < "${SRC_ROOT}/VERSION")"
 fi
@@ -211,11 +214,14 @@ else
   printf '%s\n' "$INSTALL_VERSION" > "${SHIELD_HOME}/VERSION"
 fi
 
-cat > "${SHIELD_HOME}/config.env" <<EOF
-# Managed by agy-auth-shield installer
-AGY_AUTH_SHIELD_PORT=${SHIELD_PORT}
-AGY_AUTH_SHIELD_LABEL=${SERVICE_LABEL}
-EOF
+{
+  printf '# Managed by agy-auth-shield installer\n'
+  printf 'AGY_AUTH_SHIELD_PORT=%s\n' "$SHIELD_PORT"
+  printf 'AGY_AUTH_SHIELD_LABEL=%s\n' "$SERVICE_LABEL"
+  if [[ "$OPT_NO_SERVICE" == "1" ]]; then
+    printf 'AGY_AUTH_SHIELD_NO_SERVICE=1\n'
+  fi
+} > "${SHIELD_HOME}/config.env"
 chmod 600 "${SHIELD_HOME}/config.env"
 
 cat > "${SHIELD_HOME}/.agy-auth-shield-managed" <<EOF
